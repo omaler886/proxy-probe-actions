@@ -127,6 +127,22 @@ class AuditTests(unittest.TestCase):
                     "duplicate_connection_occurrences", "merged_duplicate_names"):
             self.assertEqual(report["totals"][key], 0, key)
 
+    def test_health_fails_when_geolocation_disabled(self):
+        # Every name is -Unknown: the publisher clearly ran without lookups.
+        nodes = [node("🇺🇸美国-Unknown") for _ in range(10)]
+        self._source("broken", nodes)
+        self.artifacts.merged = {"proxies": nodes}
+        report = a.audit(self.artifacts)
+        self.assertFalse(report["health"]["ok"])
+        self.assertIn("geolocation", report["health"]["reason"])
+
+    def test_health_ok_when_all_names_resolved(self):
+        nodes = [node("🇺🇸美国-AWS-Ashburn"), node("🇭🇰香港-HKT-中环")]
+        self._source("good", nodes)
+        self.artifacts.merged = {"proxies": nodes}
+        report = a.audit(self.artifacts)
+        self.assertTrue(report["health"]["ok"])
+
     def test_report_is_renderable_as_utf8_bytes(self):
         self._source("pokenmen", [node("🇭🇰香港-Hong-Hong Kong-3")])
         rendered = a.render(a.audit(self.artifacts))

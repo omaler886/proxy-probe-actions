@@ -251,6 +251,24 @@ def audit(artifacts):
         1 for name in merged_names if GENERIC_BRAND.search(str(name)))
     report["totals"]["hash_suffix_merged"] = sum(
         1 for name in merged_names if HASH_SUFFIX.search(str(name)))
+
+    # Health verdict: a high Unknown ratio means the publisher's geolocation
+    # did not run (PROBE_GEO_LOOKUP=0 or the monthly ASN dump failed), which is
+    # a config failure rather than a naming-style nit. Surface it explicitly.
+    total_merged = len(merged_names) or 1
+    unknown_merged = sum(1 for name in merged_names
+                         if UNKNOWN_BRAND.search(str(name)))
+    ratio = unknown_merged / total_merged
+    healthy = (ratio <= 0.05 and not report["totals"]["counter_suffix_merged"]
+               and not report["totals"]["generic_brand_merged"])
+    report["health"] = {
+        "ok": healthy,
+        "unknown_merged": unknown_merged,
+        "unknown_ratio": round(ratio, 4),
+        "reason": ("" if healthy else
+                   "geolocation lookup likely disabled (PROBE_GEO_LOOKUP / ASN dump)"
+                   if ratio > 0.05 else "naming defects still present"),
+    }
     return report
 
 
@@ -262,6 +280,15 @@ def render(report):
     add("  nodes in sources  : %d" % report["totals"]["source_nodes"])
     add("  merged proxies    : %d" % report["merged_proxies"])
     add("  merged unique     : %d" % report["totals"]["merged_unique_names"])
+    health = report.get("health", {})
+    if health:
+        verdict = "OK" if health.get("ok") else "FAIL"
+        add("  health            : %s" % verdict)
+        if not health.get("ok"):
+            add("      reason: %s" % health.get("reason", ""))
+            add("      unknown names: %d (%.1f%%)" %
+                (health.get("unknown_merged", 0),
+                 100 * health.get("unknown_ratio", 0)))
     if report["errors"]:
         add("  fetch errors      : %d" % len(report["errors"]))
         for error in report["errors"][:5]:
