@@ -136,6 +136,30 @@ class SelectionTests(unittest.TestCase):
 
 
 class DependencyTests(unittest.TestCase):
+    def test_duplicate_upstream_names_are_renamed_not_fatal(self):
+        config = {"proxies": [node("same", server="a.invalid"), node("same", server="b.invalid"), node("same", server="c.invalid")]}
+        deduped = p.dedupe_names(config)
+        names = [item["name"] for item in deduped["proxies"]]
+        self.assertEqual(len(set(names)), 3)
+        self.assertEqual(names[0], "same")
+        # The original config is never mutated in place.
+        self.assertEqual([item["name"] for item in config["proxies"]], ["same", "same", "same"])
+        graph = p.Graph(deduped)
+        self.assertEqual(len(graph.nodes), 3)
+        # A source with duplicated names still publishes every measured node.
+        measurements = [p.Measurement(name, "8.8.8.8", "US") for name in names]
+        text, published = p.source_output("airport", graph, measurements)
+        self.assertEqual(published, 3)
+        self.assertEqual(len(yaml.safe_load(text)["proxies"]), 3)
+
+    def test_duplicate_names_keep_the_first_for_dialer_references(self):
+        config = {"proxies": [node("front", server="f.invalid"), node("exit", **{"dialer-proxy": "front"}),
+                              node("front", server="f2.invalid")]}
+        deduped = p.dedupe_names(config)
+        graph = p.Graph(deduped)
+        self.assertEqual(graph.dependency(graph.nodes["exit"]), "front")
+        self.assertEqual(len(graph.nodes), 3)
+
     def test_named_direct_and_non_proxy_types_rejected(self):
         for proto in ("direct", "DIRECT", "reject", "dns", "pass", "unknown"):
             with self.subTest(proto=proto):

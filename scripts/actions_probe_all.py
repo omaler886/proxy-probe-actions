@@ -187,7 +187,39 @@ class SubStore:
         value = yaml.safe_load(raw)
         if not isinstance(value, dict) or not isinstance(value.get("proxies"), list):
             raise ProbeError("subscription_invalid")
-        return value
+        return dedupe_names(value)
+
+
+def dedupe_names(config):
+    """Make duplicate upstream node names unique, the way the kernel needs them.
+
+    mihomo keys proxies by name and silently drops later duplicates, so a
+    subscription that lists the same name for several servers (dafeng had 40
+    entries for 16 names) would lose nodes without any diagnostic. The first
+    occurrence keeps the original name so a dialer reference still resolves to
+    it; later occurrences get a deterministic numeric suffix. Exported names are
+    replaced by the stable fingerprint names anyway.
+    """
+    result = copy.deepcopy(config)
+    for field in ("proxies", "proxy-groups"):
+        seen = {}
+        for item in result.get(field) or []:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            if name not in seen:
+                seen[name] = 1
+                continue
+            seen[name] += 1
+            candidate = "%s#%d" % (name, seen[name])
+            while candidate in seen:
+                seen[name] += 1
+                candidate = "%s#%d" % (name, seen[name])
+            seen[candidate] = 1
+            item["name"] = candidate
+    return result
 
 
 class Graph:
@@ -507,7 +539,7 @@ def source_output(source, graph, measurements):
 def measure_source(name, config, front, probe):
     result = SourceResult(name, input=len(config.get("proxies", [])))
     try:
-        graph = Graph(config, front)
+        graph = Graph(dedupe_names(config), front)
         roots = [item["name"] for item in config["proxies"]]
         measurements, invalid = probe(graph, roots)
         result.alive = len(measurements)
