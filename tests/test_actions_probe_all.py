@@ -44,6 +44,9 @@ class FakeGist:
     def __call__(self, method, url, headers=None, body=None):
         self.calls.append((method, url, headers, body))
         if method == "PATCH":
+            # Reproduce the real Gist endpoint: unsafe conditional headers 400.
+            if any(key.lower() == "if-match" for key in (headers or {})):
+                raise p.ProbeError("http_400")
             if self.fail_patch:
                 raise p.ProbeError("http_failure")
             update = json.loads(body)["files"]
@@ -276,13 +279,59 @@ class PublisherTests(unittest.TestCase):
                 raise p.ProbeError("http_412")
             return remote(method, url, headers, body)
         self.assertEqual(self.publisher(transport).publish([candidate(count=5)])[0], "published")
-        self.assertEqual(calls, ["GET", "PATCH", "GET", "PATCH"])
+        self.assertEqual(calls, ["GET", "GET", "PATCH", "GET", "GET", "PATCH"])
         def always_conflict(method, url, headers=None, body=None):
             if method == "PATCH":
                 raise p.ProbeError("http_412")
             return remote(method, url, headers, body)
         with self.assertRaises(p.ProbeError):
             self.publisher(always_conflict).publish([candidate(count=6)])
+
+    def test_managed_snapshot_change_replans_without_losing_concurrent_source(self):
+        remote = FakeGist(self.old)
+        reads = []
+        concurrent = candidate("concurrent", 6)
+        def transport(method, url, headers=None, body=None):
+            if method == "GET":
+                reads.append(True)
+                if len(reads) == 2:
+                    remote.files.update(p.plan_updates([concurrent], remote.files))
+            return remote(method, url, headers, body)
+        self.assertEqual(self.publisher(transport).publish([candidate(count=5)])[0], "published")
+        self.assertEqual(len(reads), 4)
+        self.assertEqual(remote.files[p.source_file("concurrent")], concurrent.content)
+        self.assertNotIn(p.source_file("concurrent"), remote.patches[0])
+        self.assertEqual(len(remote.patches), 1)
+
+    def test_continuously_changing_managed_snapshot_aborts_bounded(self):
+        remote = FakeGist(self.old)
+        reads = []
+        def transport(method, url, headers=None, body=None):
+            if method == "GET":
+                reads.append(True)
+                manifest = json.loads(remote.files["manifest.json"])
+                manifest["concurrent_counter"] = len(reads)
+                remote.files["manifest.json"] = json.dumps(manifest)
+            return remote(method, url, headers, body)
+        with self.assertRaises(p.ProbeError) as got:
+            self.publisher(transport).publish([candidate(count=5)])
+        self.assertEqual(p.error_code(got.exception), "gist_conflict")
+        self.assertEqual(len(reads), 6)
+        self.assertEqual(remote.patches, [])
+
+    def test_unrelated_snapshot_change_does_not_conflict_or_get_overwritten(self):
+        remote = FakeGist(dict(self.old, **{"hb-full.yaml": "old"}))
+        reads = []
+        def transport(method, url, headers=None, body=None):
+            if method == "GET":
+                reads.append(True)
+                if len(reads) == 2:
+                    remote.files["hb-full.yaml"] = "changed concurrently"
+            return remote(method, url, headers, body)
+        self.assertEqual(self.publisher(transport).publish([candidate(count=5)])[0], "published")
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(remote.files["hb-full.yaml"], "changed concurrently")
+        self.assertNotIn("hb-full.yaml", remote.patches[0])
 
     def test_half_previous_is_accepted(self):
         remote = FakeGist(self.old)
@@ -341,11 +390,12 @@ class PublisherTests(unittest.TestCase):
             self.publisher(remote).publish([self.initial])
         self.assertEqual(len(remote.calls), 1)
 
-    def test_patch_has_etag_and_manifest_is_atomic(self):
+    def test_patch_has_no_unsupported_if_match_and_manifest_is_atomic(self):
         remote = FakeGist(self.old)
         self.publisher(remote).publish([candidate(count=5)])
         patch = next(call for call in remote.calls if call[0] == "PATCH")
-        self.assertEqual(patch[2]["If-Match"], '"version"')
+        self.assertNotIn("If-Match", patch[2])
+        self.assertEqual([call[0] for call in remote.calls], ["GET", "GET", "PATCH"])
         self.assertIn("manifest.json", remote.patches[0])
         self.assertIn("mihomo-alive.yaml", remote.patches[0])
         self.assertNotIn("history", " ".join(remote.patches[0]))

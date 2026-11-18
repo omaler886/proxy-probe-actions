@@ -9,7 +9,7 @@ Private execution repository. Subscription data and API tokens never belong in G
 3. Request `https://www.cloudflare.com/cdn-cgi/trace` through a node-specific loopback HTTP listener, with certificate validation and no direct fallback. Only a successful trace with a global `ip` and valid `loc` counts as alive.
 4. Rename from source/country/protocol/exit hash/connection fingerprint. Timing is not embedded in names.
 5. For **GlaDOS only**, group successful nodes by actual trace exit IP; prefer Shadowsocks (`ss`), then a stable connection fingerprint. Where there is no live SS, keep one deterministic non-SS node. Other sources are not collapsed by exit.
-6. PATCH fixed files in the existing secret Gist. Preserve failed/empty/severely reduced sources from the previous successful publication. Retain unrelated Gist files. Same YAML content produces no new revision.
+6. PATCH fixed files in the existing secret Gist. Preserve failed/empty/severely reduced sources from the previous successful publication. Retain unrelated Gist files. Same YAML content produces no new revision. GitHub Gist PATCH rejects `If-Match` (HTTP 400); instead serialize this workflow and recheck the managed-file snapshot before writing. This is not server-side atomic compare-and-swap: never add a second writer for these managed filenames.
 
 ## Trigger / cadence
 

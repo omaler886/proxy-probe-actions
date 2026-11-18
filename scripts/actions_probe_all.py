@@ -642,14 +642,14 @@ class GistPublisher:
             try:
                 return self._publish_once(results)
             except ProbeError as exc:
-                if error_code(exc) != "http_412" or attempt == 2:
+                if error_code(exc) not in {"http_412", "gist_conflict"} or attempt == 2:
                     raise
                 # Concurrent change: discard the old plan completely and read
                 # current private state again before constructing another PATCH.
         raise ProbeError("gist_conflict")
 
     def _publish_once(self, results):
-        old, etag = self.current()  # No PATCH at all if any read/parse/guard fails.
+        old, _ = self.current()  # No PATCH at all if any read/parse/guard fails.
         files = plan_updates(results, old)
         if not any(SOURCE_FILE.fullmatch(name) for name in files):
             # A completely failed first run must not create an empty subscription.
@@ -664,9 +664,15 @@ class GistPublisher:
         updates = dict(yaml_updates)
         if digest(files["manifest.json"]) != digest(old.get("manifest.json", "")):
             updates["manifest.json"] = {"content": files["manifest.json"]}
+        # GitHub Gist PATCH rejects If-Match (HTTP 400): no atomic CAS exists
+        # for this endpoint. Serialize our writer in Actions. Re-read managed
+        # content immediately before PATCH and re-plan on a detected change;
+        # this narrows, but cannot eliminate, the cross-writer race window.
+        # Unrelated files are excluded from both comparison and PATCH payload.
+        latest, _ = self.current()
+        if latest != old:
+            raise ProbeError("gist_conflict")
         headers = dict(self.headers, **{"Content-Type": "application/json"})
-        if etag:
-            headers["If-Match"] = etag
         self.transport("PATCH", self.url, headers, json_text({"files": updates}).encode())
         return "published", files
 
