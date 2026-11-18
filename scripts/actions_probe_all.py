@@ -75,7 +75,16 @@ def source_file(name: str) -> str:
 
 
 def selected_source(name: str) -> bool:
-    return bool(name) and not name.lower().startswith(("probe-", "chain-", "rust-")) and name not in {"测活-DMIT", "官方可用"}
+    """Upstream origins only: never our own published artifacts.
+
+    `gist-` names are the remote subscriptions that point back at this
+    publisher's fixed Gist files. Measuring them would feed the round its own
+    previous output (and quietly re-measure renamed nodes), so they are
+    excluded exactly like the legacy `probe-`/`chain-`/`rust-` products.
+    """
+    return (bool(name)
+            and not name.lower().startswith(("probe-", "chain-", "rust-", "gist-"))
+            and name not in {"测活-DMIT", "官方可用"})
 
 
 def canonical(value) -> str:

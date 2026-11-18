@@ -88,7 +88,8 @@ class TraceTests(unittest.TestCase):
 
 class SelectionTests(unittest.TestCase):
     def test_exclusions_and_front_allowed(self):
-        for name in ("probe-x", "chain-x", "rust-x", "PROBE-x", "测活-DMIT", "官方可用"):
+        for name in ("probe-x", "chain-x", "rust-x", "PROBE-x", "测活-DMIT", "官方可用",
+                     "gist-glados", "GIST-prologue", "gist-健康中心"):
             self.assertFalse(p.selected_source(name))
         for name in ("glados", "GlaDOS", "cf-front", "原始机场", "官方可用机场"):
             self.assertTrue(p.selected_source(name))
