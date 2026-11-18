@@ -111,6 +111,42 @@ _GENERIC = {
     "hosting", "server", "servers", "limited", "company",
 }
 
+# Registry handles are frequently truncated ("NEXUSWAVE-COMMUNICAT"), so a
+# prefix match is needed as well as an exact one.
+_GENERIC_STEM = ("communicat", "telecom", "network", "broadband", "technolog",
+                 "internet", "digital", "hosting", "solution", "service",
+                 "enterprise", "limited", "company", "holding")
+
+
+# Registry handles are frequently truncated ("NEXUSWAVE-COMMUNICAT"), so a
+# word counts as generic when it is a PREFIX of a known generic word. The
+# relation is deliberately one-directional: "COMMUNICAT" is a truncated
+# "communication", but "DIGITALOCEAN" is not a "digital" and must survive.
+_GENERIC_WORDS = tuple(sorted(_GENERIC))
+
+
+def _is_generic(token):
+    """True when a word describes a geography or a role, never a brand."""
+    lowered = (token or "").lower().strip("-& ")
+    if not lowered or len(lowered) < 2:
+        return True
+    if lowered in _GENERIC:
+        return True
+    return any(word.startswith(lowered) and word != lowered
+               for word in _GENERIC_WORDS)
+
+
+def _brand_word(token):
+    """Strip registry noise from one candidate word, then test it."""
+    cleaned = _RIR_SUF.sub("", token).strip(" -&_")
+    if not cleaned or len(cleaned) < 2:
+        return ""
+    if re.fullmatch(r"(?i)asn?\d*", cleaned):    # bare AS handle, not a brand
+        return ""
+    if _is_generic(cleaned):
+        return ""
+    return cleaned[:20]
+
 _LEGAL = re.compile(
     r"(?i)\b(inc|llc|ltd|limited|corp|corporation|co|company|gmbh|sarl|plc|"
     r"group|holdings|enterprises|solutions|services|telecom|telecommunications|"
@@ -118,7 +154,8 @@ _LEGAL = re.compile(
 
 # RIR / registry handle noise: HKBN-AS-AP, HKBNES-AS-AP, CLOUDFLARENET-...
 _RIR_SUF = re.compile(
-    r"(?:[-_](?:AS|ASN))?(?:[-_](?:AP|EU|US|ARIN|RIPE|APNIC|LACNIC|AFRINIC))+$"
+    r"(?:[-_](?:AS|ASN)\d*)?(?:[-_](?:AP|EU|US|ARIN|RIPE|APNIC|LACNIC|AFRINIC))+$"
+    r"|[-_](?:AS|ASN)\d*$"
     r"|[-_](?:NET|COM|ORG|INFO|BIZ)$", re.I)
 
 _CYMRU_DOH = (
@@ -262,9 +299,13 @@ def _ipwho(ip):
 def _org_brand(raw, asn=0):
     """Brand token for an ASN. The ASN table wins; generics are never returned.
 
-    "Hong Kong Broadband Network Ltd." with no table hit yields ``HKBN``-style
-    handles only if a real handle word exists; otherwise the second meaningful
-    word, and as the last resort the ASN number. ``Hong`` can never come out.
+    Registry handles arrive in several shapes and all of them must resolve:
+      "Hong Kong Broadband Network Ltd."   -> "" (caller falls back to AS<num>)
+      "NEXUSWAVE-COMMUNICAT"               -> NEXUSWAVE
+      "DIGITALOCEAN-AS39340"               -> DIGITALOCEAN
+      "M247 Europe SRL"                    -> M247
+    Splitting on the hyphen as well as on spaces is what stops a truncated
+    role word ("COMMUNICAT") from being glued onto a real brand.
     """
     if asn and asn in ASN_SHORT:
         return ASN_SHORT[asn]
@@ -273,17 +314,13 @@ def _org_brand(raw, asn=0):
         return ""
     text = _LEGAL.sub(" ", text)
     text = re.sub(r"[^A-Za-z0-9& -]", " ", text)
-    words = [word for word in text.split() if word]
-    if not words:
-        return ""
-    meaningful = [word for word in words
-                  if word.lower() not in _GENERIC and len(word) > 1]
-    if meaningful:
-        brand = _RIR_SUF.sub("", meaningful[0]).strip(" -&") or meaningful[0]
-        if brand.lower() not in _GENERIC and len(brand) > 2:
-            return brand[:20]
-        if brand.lower() not in _GENERIC:
-            return brand[:20]
+    for word in text.split():
+        for piece in word.split("-"):
+            if piece.isdigit():          # "48.9 Core LLC" -> skip the number
+                continue
+            brand = _brand_word(piece)
+            if brand:
+                return brand
     # Every word was generic ("Hong Kong Broadband Network", "Korea Telecom").
     # Returning "" makes the caller fall back to the AS number, which is honest;
     # emitting "Hong" or "Korea" as if it were a brand is exactly the old bug.
