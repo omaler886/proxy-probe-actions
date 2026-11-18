@@ -99,5 +99,21 @@ jobs:
           test -n "$SUBSTORE_BASE"
           test -n "$GIST_TOKEN"
           python scripts/actions_probe_all.py
+      - name: Audit published artifacts for naming and dedup defects
+        env:
+          PROBE_OUTPUT_DIR: ${{ runner.temp }}/probe-output
+        run: |
+          set -euo pipefail
+          # The runner already holds this round's published files. Auditing the
+          # local copy avoids extra GitHub API calls and rate limits. The report
+          # is printed as a job summary; no subscription bodies are uploaded.
+          python scripts/audit_artifacts.py --dir "$PROBE_OUTPUT_DIR" \
+            --report "$RUNNER_TEMP/artifact-audit.txt"
+          {
+            echo '## Artifact audit'
+            echo '```'
+            cat "$RUNNER_TEMP/artifact-audit.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       # Subscription/config bodies contain credentials. Never upload them as
       # Actions artifacts or caches; ephemeral runner storage is destroyed.
