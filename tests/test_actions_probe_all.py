@@ -110,11 +110,20 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(len(p.choose_measurements("another", graph, measurements)), 3)
         self.assertEqual(len(p.choose_measurements("glados-pro", graph, measurements)), 3)
 
-    def test_glados_without_ss_has_no_non_ss_fallback(self):
+    def test_glados_without_ss_keeps_deterministic_one_per_exit(self):
         graph = p.Graph({"proxies": [node("a", "vmess"), node("b", "trojan")]})
         measurements = [p.Measurement(n, "8.8.8.8", "US") for n in ("a", "b")]
-        self.assertEqual(p.choose_measurements("glados", graph, measurements), [])
+        self.assertEqual(len(p.choose_measurements("glados", graph, measurements)), 1)
         self.assertEqual(p.choose_measurements("glados", graph, measurements), p.choose_measurements("glados", graph, measurements[::-1]))
+
+    def test_unique_non_ss_exit_survives_with_duplicate_exit_ss_preferred(self):
+        graph = p.Graph({"proxies": [node("ss-shared", "ss"), node("trojan-shared", "trojan"), node("unique-anytls", "anytls")]})
+        measurements = [p.Measurement("ss-shared", "8.8.8.8", "US"),
+                        p.Measurement("trojan-shared", "8.8.8.8", "US"),
+                        p.Measurement("unique-anytls", "1.1.1.1", "AU")]
+        chosen = p.choose_measurements("glados", graph, measurements)
+        self.assertEqual({item.name for item in chosen}, {"ss-shared", "unique-anytls"})
+        self.assertEqual(len(p.choose_measurements("another", graph, measurements)), 3)
 
     def test_names_stable_without_upstream_name_or_latency(self):
         graph = p.Graph({"proxies": [node("upstream secret")]})

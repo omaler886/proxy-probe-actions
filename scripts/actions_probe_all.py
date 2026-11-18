@@ -473,11 +473,9 @@ def choose_measurements(source, graph, measurements):
         return sorted(measurements, key=lambda m: (graph.identity(m.name), m.name))
     by_exit = {}
     for item in measurements:
-        # The user requested SS-only GlaDOS output, not a non-SS fallback when
-        # an exit has no successful Shadowsocks entry. Other sources are unchanged.
-        if str(graph.nodes[item.name].get("type", "")).lower() != "ss":
-            continue
-        key = (graph.identity(item.name), item.name)
+        # Deduplicate by measured exit only. SS is preferred WITHIN an exit
+        # group; a unique non-SS exit is retained, never globally filtered out.
+        key = (0 if str(graph.nodes[item.name].get("type", "")).lower() == "ss" else 1, graph.identity(item.name), item.name)
         if item.ip not in by_exit or key < by_exit[item.ip][0]:
             by_exit[item.ip] = (key, item)
     return [value[1] for _, value in sorted(by_exit.items())]
