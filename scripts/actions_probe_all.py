@@ -1,0 +1,674 @@
+#!/usr/bin/env python3
+"""All-source Actions probe (stdlib + PyYAML); no Sub-Store writes or exit cache.
+
+Run: SUBSTORE_BASE=... MIHOMO_BIN=/path/mihomo PROBE_OUTPUT_DIR=/private/path
+     python scripts/actions_probe_all.py
+Optional: GIST_TOKEN + GIST_ID (or GITHUB_GIST_ID), PROBE_CONCURRENCY=8,
+PROBE_TIMEOUT=15, PROBE_FRONT_SUB=cf-front. Output contains credentials: NEVER
+upload this directory as an Actions artifact. Serialize workflow runs externally.
+Dependency groups are frozen to deterministic select groups (same complete member
+closure), preventing background health checks, fallback-to-DIRECT and latency churn.
+No previous measurement is ever used as evidence that a node is alive.
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import copy
+from dataclasses import dataclass
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import yaml
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
+SOURCE_FILE = re.compile(r"source-[0-9a-f]{64}\.yaml\Z")
+BUILTINS = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL"}
+# Non-connection annotations must not change the stable connection identity.
+ANNOTATIONS = {"name", "_probe_state", "_probe", "dialer-proxy", "dialer_proxy",
+               "detour", "benchmark", "latency", "delay"}
+COUNTRIES = set("AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS XK YE YT ZA ZM ZW".split())
+
+
+class ProbeError(Exception):
+    """Deliberately contains only a non-sensitive category."""
+
+
+def digest(value: str | bytes) -> str:
+    return hashlib.sha256(value.encode() if isinstance(value, str) else value).hexdigest()
+
+
+def source_file(name: str) -> str:
+    return "source-" + digest(name) + ".yaml"
+
+
+def selected_source(name: str) -> bool:
+    return bool(name) and not name.lower().startswith(("probe-", "chain-", "rust-")) and name not in {"测活-DMIT", "官方可用"}
+
+
+def canonical(value) -> str:
+    return yaml.safe_dump(value, allow_unicode=True, sort_keys=True, width=100000)
+
+
+def json_text(value) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def parse_trace(text: str) -> tuple[str, str]:
+    if len(text) > 65536:
+        raise ProbeError("trace_invalid")
+    fields = {}
+    for line in text.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            if key in fields:
+                raise ProbeError("trace_invalid")
+            fields[key] = value.strip()
+    try:
+        addr = ipaddress.ip_address(fields.get("ip", ""))
+    except ValueError:
+        raise ProbeError("trace_invalid") from None
+    cc = fields.get("loc", "")
+    if not addr.is_global or addr.is_multicast or cc not in COUNTRIES:
+        raise ProbeError("trace_invalid")
+    return str(addr), cc
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class Transport:
+    """Bounded responses, explicit redirect validation; injectable in offline tests."""
+    def __init__(self, timeout=30):
+        self.timeout = timeout
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+    def __call__(self, method, url, headers=None, body=None):
+        headers = dict(headers or {})
+        headers.setdefault("User-Agent", UA)
+        original = urllib.parse.urlsplit(url)
+        github = "Authorization" in headers and original.hostname in {"api.github.com", "gist.githubusercontent.com"}
+        for _ in range(5):
+            parts = urllib.parse.urlsplit(url)
+            if github and (parts.scheme != "https" or parts.hostname not in {"api.github.com", "gist.githubusercontent.com"} or parts.port not in (None, 443) or parts.username):
+                raise ProbeError("github_redirect")
+            try:
+                request = urllib.request.Request(url, data=body, headers=headers, method=method)
+                with self.opener.open(request, timeout=self.timeout) as response:
+                    data = response.read(32 * 1024 * 1024 + 1)
+                    if len(data) > 32 * 1024 * 1024:
+                        raise ProbeError("response_large")
+                    return data, dict(response.headers)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (301, 302, 303, 307, 308) and method == "GET":
+                    new_url = urllib.parse.urljoin(url, exc.headers.get("Location", ""))
+                    new_parts = urllib.parse.urlsplit(new_url)
+                    if not github and (new_parts.scheme, new_parts.netloc) != (original.scheme, original.netloc):
+                        raise ProbeError("upstream_redirect") from None
+                    url = new_url
+                    continue
+                raise ProbeError("http_failure") from None
+            except (OSError, ValueError):
+                raise ProbeError("transport_failure") from None
+        raise ProbeError("redirect_limit")
+
+
+class SubStore:
+    def __init__(self, base, transport):
+        parsed = urllib.parse.urlsplit(base)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.query or parsed.fragment:
+            raise ProbeError("base_invalid")
+        self.base, self.transport = base.rstrip("/"), transport
+
+    def sources(self):
+        raw, _ = self.transport("GET", self.base + "/api/subs")
+        obj = json.loads(raw)
+        data = obj.get("data", obj) if isinstance(obj, dict) else obj
+        if isinstance(data, dict):
+            data = list(data.values())
+        if not isinstance(data, list):
+            raise ProbeError("sources_invalid")
+        names = {item["name"] for item in data if isinstance(item, dict) and isinstance(item.get("name"), str) and selected_source(item["name"])}
+        return sorted(names)
+
+    def config(self, name):
+        raw, _ = self.transport("GET", self.base + "/download/" + urllib.parse.quote(name, safe="") + "/mihomo")
+        value = yaml.safe_load(raw)
+        if not isinstance(value, dict) or not isinstance(value.get("proxies"), list):
+            raise ProbeError("subscription_invalid")
+        return value
+
+
+class Graph:
+    """Resolve every dialer and group dependency; missing references fail closed."""
+    def __init__(self, config, front=None):
+        self.nodes, self.groups = {}, {}
+        # Source definitions override identically named front definitions.
+        for doc in (front or {}, config):
+            for field, target in (("proxies", self.nodes), ("proxy-groups", self.groups)):
+                local = set()
+                for item in doc.get(field, []) or []:
+                    if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                        raise ProbeError("definition_invalid")
+                    name = item["name"]
+                    if name in local or name in BUILTINS:
+                        raise ProbeError("definition_duplicate")
+                    local.add(name)
+                    target[name] = copy.deepcopy(item)
+        if set(self.nodes) & set(self.groups):
+            raise ProbeError("definition_collision")
+        self.cache = {}
+
+    def dependency(self, node):
+        refs = [node[key] for key in ("dialer-proxy", "dialer_proxy", "detour") if key in node]
+        if len(refs) > 1 or (refs and not isinstance(refs[0], str)):
+            raise ProbeError("dependency_invalid")
+        return refs[0] if refs else None
+
+    def identity(self, name, stack=()):
+        if name in self.cache:
+            return self.cache[name]
+        if name in stack or name in BUILTINS:
+            raise ProbeError("dependency_cycle_or_direct")
+        path = stack + (name,)
+        if name in self.nodes:
+            item = self.nodes[name]
+            value = {k: v for k, v in item.items() if k not in ANNOTATIONS and not k.startswith("_probe")}
+            ref = self.dependency(item)
+            if ref:
+                value["dialer-resolved"] = self.identity(ref, path)
+        elif name in self.groups:
+            item = self.groups[name]
+            refs = item.get("proxies")
+            if item.get("use") or not isinstance(refs, list) or not refs:
+                raise ProbeError("dependency_missing")
+            # A deterministic select, never a health/latency-selected chain.
+            value = {"group": sorted(self.identity(ref, path) for ref in refs)}
+        else:
+            raise ProbeError("dependency_missing")
+        fp = digest(json_text(value))
+        self.cache[name] = fp
+        return fp
+
+    def closure(self, roots):
+        nodes, groups = set(), set()
+
+        def visit(name):
+            self.identity(name)  # validates cycles, builtins and missing references
+            if name in self.nodes:
+                if name in nodes:
+                    return
+                nodes.add(name)
+                ref = self.dependency(self.nodes[name])
+                if ref:
+                    visit(ref)
+            else:
+                if name in groups:
+                    return
+                groups.add(name)
+                for ref in self.groups[name]["proxies"]:
+                    visit(ref)
+        for root in roots:
+            visit(root)
+        return nodes, groups
+
+    def export(self, roots, names=None):
+        nodes, groups = self.closure(roots)
+        names = names or {name: name for name in nodes | groups}
+        proxies = []
+        for name in sorted(nodes, key=lambda n: (self.identity(n), n)):
+            item = {k: copy.deepcopy(v) for k, v in self.nodes[name].items() if not k.startswith("_probe") and k not in {"dialer_proxy", "detour"}}
+            item["name"] = names[name]
+            ref = self.dependency(self.nodes[name])
+            if ref:
+                item["dialer-proxy"] = names[ref]
+            proxies.append(item)
+        output = {"proxies": proxies}
+        if groups:
+            output["proxy-groups"] = [{"name": names[name], "type": "select", "proxies": [names[ref] for ref in sorted(set(self.groups[name]["proxies"]), key=lambda n: (self.identity(n), n))]} for name in sorted(groups, key=lambda n: (self.identity(n), n))]
+        return output
+
+
+def unused_ports(count):
+    holders = []
+    try:
+        for _ in range(count):
+            sock = socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            holders.append(sock)
+        return [sock.getsockname()[1] for sock in holders]
+    finally:
+        for sock in holders:
+            sock.close()
+
+
+def kernel_config(graph, roots, ports, controller, secret):
+    cfg = graph.export(roots)
+    cfg.update({
+        "allow-lan": False, "bind-address": "127.0.0.1", "mode": "rule",
+        "ipv6": True, "log-level": "silent", "external-controller": "127.0.0.1:" + str(controller),
+        "secret": secret, "external-ui": "", "geodata-mode": False, "geo-auto-update": False,
+        "find-process-mode": "off", "profile": {"store-selected": False, "store-fake-ip": False},
+        "dns": {"enable": False}, "tun": {"enable": False},
+        "listeners": [{"name": "lane-" + str(index), "type": "http", "listen": "127.0.0.1", "port": port, "proxy": root} for index, (root, port) in enumerate(zip(roots, ports))],
+        "rules": ["MATCH,REJECT"],
+    })
+    return cfg
+
+
+def private_dir(path):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+    return path
+
+
+def private_write(path, content):
+    path = Path(path)
+    # Random temp file in the same private directory; atomic replacement.
+    fd, tmp = tempfile.mkstemp(prefix=".write-", dir=str(path.parent))
+    try:
+        os.chmod(tmp, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+@dataclass
+class Measurement:
+    name: str
+    ip: str
+    cc: str
+
+
+@dataclass
+class SourceResult:
+    name: str
+    input: int = 0
+    alive: int = 0
+    published: int = 0
+    content: str | None = None
+    failed: bool = False
+
+
+class NativeProbe:
+    def __init__(self, binary, workers=8, timeout=15, transport=None):
+        self.binary = binary
+        self.workers = max(1, min(32, int(workers)))
+        self.timeout = max(1, min(120, int(timeout)))
+        self.transport = transport or Transport(timeout=2)
+
+    def validate(self, directory, cfg):
+        path = Path(directory) / "config.yaml"
+        private_write(path, canonical(cfg))
+        try:
+            run = subprocess.run([self.binary, "-t", "-d", str(directory), "-f", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            return run.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            raise ProbeError("kernel_validation_failure") from None
+
+    def trace(self, port, directory):
+        # stdout is a private regular file, not a captured named pipe (Windows).
+        fd, path = tempfile.mkstemp(prefix="trace-", dir=str(directory))
+        os.chmod(path, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                run = subprocess.run([
+                    "curl", "--disable", "--silent", "--show-error", "--fail", "--noproxy", "",
+                    "--proxy", "http://127.0.0.1:" + str(port), "--max-time", str(self.timeout),
+                    "--connect-timeout", str(min(10, self.timeout)), "--proto", "=https",
+                    "--max-filesize", "65536", TRACE_URL,
+                ], stdout=stream, stderr=subprocess.DEVNULL, timeout=self.timeout + 3)
+            if run.returncode:
+                return None
+            return parse_trace(Path(path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, subprocess.TimeoutExpired, ProbeError):
+            return None
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def health(self, process, controller, secret):
+        if process.poll() is not None:
+            return False
+        try:
+            raw, _ = self.transport("GET", "http://127.0.0.1:" + str(controller) + "/version", {"Authorization": "Bearer " + secret})
+            return isinstance(json.loads(raw), dict) and process.poll() is None
+        except Exception:
+            return False
+
+    def __call__(self, graph, roots):
+        accepted, invalid = [], 0
+        with tempfile.TemporaryDirectory(prefix="actions-probe-") as temp:
+            directory = private_dir(temp)
+            secret = secrets.token_urlsafe(24)
+            # Each root's complete closure is checked independently: an unsupported
+            # protocol cannot poison an otherwise healthy source.
+            for root in roots:
+                try:
+                    ports = unused_ports(2)
+                    cfg = kernel_config(graph, [root], ports[:1], ports[1], secret)
+                    if self.validate(directory, cfg):
+                        accepted.append(root)
+                    else:
+                        invalid += 1
+                except ProbeError as exc:
+                    if str(exc).startswith("kernel_"):
+                        raise
+                    invalid += 1
+            if not accepted:
+                return [], invalid
+            ports = unused_ports(len(accepted) + 1)
+            controller = ports[-1]
+            cfg = kernel_config(graph, accepted, ports[:-1], controller, secret)
+            if not self.validate(directory, cfg):
+                raise ProbeError("kernel_config_failure")
+            process = None
+            try:
+                process = subprocess.Popen([self.binary, "-d", str(directory), "-f", str(directory / "config.yaml")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                deadline = time.monotonic() + 15
+                while not self.health(process, controller, secret):
+                    if process.poll() is not None or time.monotonic() > deadline:
+                        raise ProbeError("kernel_start_failure")
+                    time.sleep(0.1)
+
+                def one(pair):
+                    root, port = pair
+                    for _ in range(2):
+                        evidence = self.trace(port, directory)
+                        if evidence:
+                            return Measurement(root, *evidence)
+                    return None
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
+                    measured = list(pool.map(one, zip(accepted, ports[:-1])))
+                if not self.health(process, controller, secret):
+                    raise ProbeError("kernel_end_failure")
+                return [item for item in measured if item], invalid
+            except OSError:
+                raise ProbeError("kernel_execution_failure") from None
+            finally:
+                if process is not None:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+
+
+def choose_measurements(source, graph, measurements):
+    if source.casefold() != "glados":
+        return sorted(measurements, key=lambda m: (graph.identity(m.name), m.name))
+    by_exit = {}
+    for item in measurements:
+        key = (0 if str(graph.nodes[item.name].get("type", "")).lower() == "ss" else 1, graph.identity(item.name), item.name)
+        if item.ip not in by_exit or key < by_exit[item.ip][0]:
+            by_exit[item.ip] = (key, item)
+    return [value[1] for _, value in sorted(by_exit.items())]
+
+
+def source_output(source, graph, measurements):
+    selected = choose_measurements(source, graph, measurements)
+    roots = [item.name for item in selected]
+    nodes, groups = graph.closure(roots)
+    namespace = digest(source)[:16]
+    label = re.sub(r"[^A-Za-z0-9]+", "-", source).strip("-")[:24] or "SOURCE"
+    label += "-" + namespace
+    names = {name: "__front-" + namespace + "-" + graph.identity(name)[:20] for name in nodes}
+    names.update({name: "G-" + namespace + "-" + graph.identity(name)[:20] for name in groups})
+    for item in selected:
+        proto = re.sub(r"[^A-Za-z0-9]", "", str(graph.nodes[item.name].get("type", "proxy"))).upper() or "PROXY"
+        names[item.name] = "-".join((label, item.cc, proto, digest(item.ip)[:12], graph.identity(item.name)[:20]))
+    # Duplicate connections within a source remain present for non-GlaDOS sources;
+    # stable suffixes avoid invalid duplicate names without including upstream names.
+    used = {}
+    for name in sorted(names, key=lambda n: (names[n], n)):
+        value = names[name]
+        used[value] = used.get(value, 0) + 1
+        if used[value] > 1:
+            names[name] += "-" + str(used[value])
+    return canonical(graph.export(roots, names)), len(selected)
+
+
+def measure_source(name, config, front, probe):
+    result = SourceResult(name, input=len(config.get("proxies", [])))
+    try:
+        graph = Graph(config, front)
+        roots = [item["name"] for item in config["proxies"]]
+        measurements, invalid = probe(graph, roots)
+        result.alive = len(measurements)
+        # A missing dependency is a per-node validation failure, never stripped.
+        result.content, result.published = source_output(name, graph, measurements)
+    except Exception:
+        result.failed = True
+    return result
+
+
+def merge_sources(contents):
+    """Dedup tested roots by resolved connection, retain independent namespaces."""
+    choices = {}
+    for filename, text in sorted(contents.items()):
+        doc = yaml.safe_load(text)
+        if not isinstance(doc, dict) or not isinstance(doc.get("proxies"), list):
+            raise ProbeError("old_content_invalid")
+        graph = Graph(doc)
+        for node in doc["proxies"]:
+            name = node["name"]
+            if name.startswith("__front-"):
+                continue
+            fp = graph.identity(name)
+            choices.setdefault(fp, (filename, graph, name))
+    merged_nodes, merged_groups = {}, {}
+    for fp in sorted(choices):
+        _, graph, root = choices[fp]
+        doc = graph.export([root])
+        for key, target in (("proxies", merged_nodes), ("proxy-groups", merged_groups)):
+            for item in doc.get(key, []):
+                old = target.get(item["name"])
+                if old is not None and old != item:
+                    raise ProbeError("namespace_collision")
+                target[item["name"]] = item
+    result = {"proxies": [merged_nodes[name] for name in sorted(merged_nodes)]}
+    if merged_groups:
+        result["proxy-groups"] = [merged_groups[name] for name in sorted(merged_groups)]
+    return canonical(result)
+
+
+def plan_updates(results, old):
+    try:
+        old_manifest = json.loads(old.get("manifest.json", "{}"))
+        previous = old_manifest.get("sources", {})
+        if not isinstance(previous, dict):
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ProbeError("manifest_invalid") from None
+    # Deliberately retain remote sources absent from today's authoritative selection.
+    effective = {key: value for key, value in old.items() if SOURCE_FILE.fullmatch(key)}
+    manifest = {"version": 1, "sources": copy.deepcopy(previous)}
+    for result in results:
+        filename = source_file(result.name)
+        last = previous.get(filename, {})
+        prior_alive = last.get("last_success_alive", last.get("alive", last.get("published", 0)))
+        try:
+            prior_alive = max(0, int(prior_alive))
+        except (ValueError, TypeError):
+            raise ProbeError("manifest_invalid") from None
+        # An older valid file without metadata still receives a conservative gate.
+        if not prior_alive and filename in effective:
+            doc = yaml.safe_load(effective[filename])
+            prior_alive = sum(not item.get("name", "").startswith("__front-") for item in doc.get("proxies", []))
+        accept = not result.failed and result.content is not None and result.alive > 0 and result.alive >= prior_alive * 0.5
+        if accept:
+            try:
+                candidate = yaml.safe_load(result.content)
+                graph = Graph(candidate)
+                roots = [item["name"] for item in candidate["proxies"]
+                         if not item["name"].startswith("__front-")]
+                graph.closure(roots)
+                accept = bool(roots) and len(roots) == result.published and result.published <= result.alive
+            except Exception:
+                accept = False
+        if accept:
+            effective[filename] = result.content
+        published = result.published if accept else last.get("published", prior_alive)
+        manifest["sources"][filename] = {
+            "name": result.name, "input": result.input, "alive": result.alive,
+            "published": published, "last_success_alive": result.alive if accept else prior_alive,
+            "preserved": not accept,
+        }
+    merged = merge_sources(effective) if effective else old.get("mihomo-alive.yaml", canonical({"proxies": []}))
+    for filename, content in effective.items():
+        entry = manifest["sources"].setdefault(filename, {})
+        entry["sha256"] = digest(content)
+    manifest["sha256"] = digest(merged)
+    files = dict(effective)
+    files["mihomo-alive.yaml"] = merged
+    files["manifest.json"] = json_text(manifest)
+    return files
+
+
+class GistPublisher:
+    def __init__(self, gist_id, token, transport):
+        if not re.fullmatch(r"[0-9a-fA-F]{5,64}", gist_id):
+            raise ProbeError("gist_id_invalid")
+        self.url = "https://api.github.com/gists/" + gist_id
+        self.headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+        self.transport = transport
+
+    def current(self):
+        raw, headers = self.transport("GET", self.url, self.headers)
+        document = json.loads(raw)
+        if document.get("public") is not False:
+            raise ProbeError("gist_not_private")
+        files = {}
+        for name, entry in document.get("files", {}).items():
+            if not SOURCE_FILE.fullmatch(name) and name not in {"mihomo-alive.yaml", "manifest.json"}:
+                continue
+            if entry.get("truncated") or not isinstance(entry.get("content"), str):
+                url = entry.get("raw_url", "")
+                parts = urllib.parse.urlsplit(url)
+                if parts.scheme != "https" or parts.hostname != "gist.githubusercontent.com" or parts.port not in (None, 443) or parts.username:
+                    raise ProbeError("gist_raw_invalid")
+                content, _ = self.transport("GET", url, self.headers)
+                files[name] = content.decode("utf-8")
+            else:
+                files[name] = entry["content"]
+        return files, headers.get("ETag", headers.get("Etag", headers.get("etag")))
+
+    def publish(self, results):
+        old, etag = self.current()  # No PATCH at all if any read/parse/guard fails.
+        files = plan_updates(results, old)
+        if not any(SOURCE_FILE.fullmatch(name) for name in files):
+            # A completely failed first run must not create an empty subscription.
+            return "no_change", files
+        # Compare EVERY canonical YAML, not just the merged projection: another
+        # source may already contribute all these same connection fingerprints.
+        # Counts/status alone must never produce standalone manifest revisions.
+        yaml_updates = {name: {"content": text} for name, text in files.items()
+                        if name != "manifest.json" and digest(text) != digest(old.get(name, ""))}
+        if not yaml_updates:
+            return "no_change", files
+        updates = dict(yaml_updates)
+        if digest(files["manifest.json"]) != digest(old.get("manifest.json", "")):
+            updates["manifest.json"] = {"content": files["manifest.json"]}
+        headers = dict(self.headers, **{"Content-Type": "application/json"})
+        if etag:
+            headers["If-Match"] = etag
+        self.transport("PATCH", self.url, headers, json_text({"files": updates}).encode())
+        return "published", files
+
+
+def read_local(directory):
+    files = {}
+    for path in directory.iterdir():
+        if path.is_file() and (SOURCE_FILE.fullmatch(path.name) or path.name in {"mihomo-alive.yaml", "manifest.json"}):
+            files[path.name] = path.read_text(encoding="utf-8")
+    return files
+
+
+def run(env=None, transport=None, probe=None):
+    env = dict(os.environ if env is None else env)
+    results, sources = [], []
+    summary = {"sources": 0, "input": 0, "alive": 0, "failure": 0}
+    try:
+        base = env.get("SUBSTORE_BASE", "").strip()
+        if not base or not env.get("PROBE_OUTPUT_DIR", "").strip():
+            raise ProbeError("environment_missing")
+        transport = transport or Transport()
+        store = SubStore(base, transport)
+        output = private_dir(env["PROBE_OUTPUT_DIR"])
+        if probe is None:
+            binary = env.get("MIHOMO_BIN", "").strip()
+            if not binary or not shutil.which(binary):
+                raise ProbeError("kernel_missing")
+            if not shutil.which("curl"):
+                raise ProbeError("curl_missing")
+            probe = NativeProbe(binary, env.get("PROBE_CONCURRENCY", 8), env.get("PROBE_TIMEOUT", 15))
+        sources = store.sources()
+        summary["sources"] = len(sources)
+        if not sources:
+            raise ProbeError("sources_empty")
+        # Fetch EVERY selected source this round, including fronts; no history skip.
+        configs = {}
+        for name in sources:
+            try:
+                configs[name] = store.config(name)
+            except Exception:
+                results.append(SourceResult(name, failed=True))
+        front_name = env.get("PROBE_FRONT_SUB", "cf-front")
+        front = configs.get(front_name)
+        if front is None and front_name and selected_source(front_name) and front_name not in sources:
+            try:
+                front = store.config(front_name)
+            except Exception:
+                pass  # Individual missing dependencies fail closed in Graph.
+        for name in sources:
+            if name in configs:
+                results.append(measure_source(name, configs[name], front, probe))
+        summary.update(input=sum(item.input for item in results), alive=sum(item.alive for item in results), failure=sum(item.failed or not item.alive for item in results))
+        if not any(not item.failed and item.alive > 0 and item.published > 0 for item in results):
+            raise ProbeError("no_successful_roots")
+        if env.get("GIST_TOKEN"):
+            gist_id = env.get("GIST_ID", env.get("GITHUB_GIST_ID", ""))
+            _, files = GistPublisher(gist_id, env["GIST_TOKEN"], transport).publish(results)
+        else:
+            files = plan_updates(results, read_local(output))
+        for name, content in files.items():
+            private_write(output / name, content)
+        return 0 if not summary["failure"] else 1, summary
+    except Exception:
+        summary["failure"] = max(1, summary["failure"])
+        return 2, summary
+
+
+def main():
+    code, summary = run()
+    # The ONLY stdout record; no URLs, source names, upstream names or exceptions.
+    print(json.dumps(summary, sort_keys=True))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
