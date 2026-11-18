@@ -8,7 +8,7 @@ Private execution repository. Subscription data and API tokens never belong in G
 2. Use native mihomo on the GitHub-hosted Ubuntu runner. Validate each node with its full dialer dependency closure; never strip a required dialer into a direct connection.
 3. Request `https://www.cloudflare.com/cdn-cgi/trace` through a node-specific loopback HTTP listener, with certificate validation and no direct fallback. Only a successful trace with a global `ip` and valid `loc` counts as alive.
 4. Rename from source/country/protocol/exit hash/connection fingerprint. Timing is not embedded in names.
-5. For **GlaDOS only**, group successful nodes by actual trace exit IP; prefer Shadowsocks (`ss`), then a stable connection fingerprint. Where there is no live SS, keep one deterministic non-SS node. Other sources are not collapsed by exit.
+5. For **GlaDOS only**, keep successful Shadowsocks (`ss`) entries, group by actual trace exit IP, and retain one deterministic connection fingerprint per exit. There is no non-SS fallback: an exit without a successful SS is omitted. Other sources keep their original protocols and are not collapsed by exit.
 6. PATCH fixed files in the existing secret Gist. Preserve failed/empty/severely reduced sources from the previous successful publication. Retain unrelated Gist files. Same YAML content produces no new revision. GitHub Gist PATCH rejects `If-Match` (HTTP 400); instead serialize this workflow and recheck the managed-file snapshot before writing. This is not server-side atomic compare-and-swap: never add a second writer for these managed filenames.
 
 ## Trigger / cadence
