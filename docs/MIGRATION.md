@@ -69,6 +69,28 @@ Gist 599bdba3…（public:false）
 
 LXC 那两台恢复 SSH 后仍需单独停用，否则可能继续写回 Sub-Store。
 
+## Sub-Store 侧迁移（2026-11-18）
+
+测活产物不再存进 Sub-Store，改成「Sub-Store 只持有稳定 URL」：
+
+- 新建 11 个远程订阅 `gist-<源>`，URL 用 **不带 revision** 的 Gist raw 形式
+  `https://gist.githubusercontent.com/omaler886/599bdba3…/raw/source-<sha256>.yaml`（实测 200，
+  永远指向最新 revision，不会因为发布产生新地址）。
+- 5 个用户集合（`air` / `测说` / `ss-air` / `非优化` / `sssssss-alive`）的成员从
+  `probe-<源>-local` 换成 `gist-<源>`，改完逐个下载校验：91 / 28 / 27 / 22 / 76 条，均可正常下载。
+- 删除 **67** 个无引用的旧测活订阅（`probe-*` / `chain-*` / `rust-*`），订阅总数 122 → 55。
+- 保留 1 个：`probe-美国 puredns-local`——该源在 Actions 侧还没产出成功产物，
+  集合 `sssss` 仍引用它，删了会让集合变空。等该源恢复自愈后按同一脚本替换。
+- 迁移前备份：`/root/substore-sync/actions-migration-20261118/collections-before-gist-migration.json`
+  与 `files-backup-20261118/subs/`（111 条订阅全文）。
+
+删除接口备忘：订阅走 `DELETE /api/sub/<name>`；`/api/file/<name>` 是文件区，对订阅名返回 500。
+
+## 已知上游问题
+
+`saki` 的订阅 URL（`saki.tomorin.xyz`）在 hk3 上直接请求返回 **HTTP 404**，Sub-Store 因此
+`/download/saki*` 报 500、0 节点。这是机场侧链接失效，不是测活结论。
+
 ## 安全边界
 
 - Gist `public: false` 只是**不被列出**，任何拿到 raw URL 的人都可读——订阅正文含节点凭据。
