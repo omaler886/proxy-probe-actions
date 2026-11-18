@@ -37,6 +37,11 @@ import urllib.request
 
 import yaml
 
+# Geolocation lives in a sibling module so the lookup providers can be tested
+# in isolation (offline) and replaced without touching the probe contract.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import geo_naming  # noqa: E402
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
@@ -509,101 +514,77 @@ class NativeProbe:
                         process.wait()
 
 
+def egress_key(ip):
+    """Dedup key for a measured exit: the IPv4 egress address.
+
+    An IPv6-only exit still needs a stable key, so mapped IPv4 and IPv6
+    literals both collapse to their canonical address text; anything that is
+    not a literal address falls back to the raw string (still deduplicated).
+    """
+    try:
+        return str(ipaddress.ip_address(str(ip)))
+    except ValueError:
+        return str(ip)
+
+
 def choose_measurements(source, graph, measurements):
-    if source.casefold() != "glados":
-        return sorted(measurements, key=lambda m: (graph.identity(m.name), m.name))
+    """One surviving node per IPv4 egress, for EVERY source.
+
+    Previously only GlaDOS was collapsed by exit and every other source
+    republished the same egress many times under -2/-3/-4 suffixes. Dedup is
+    now universal and ordered, not protocol-based filtering:
+
+      1. group by measured exit address;
+      2. within a group prefer ``ss`` (cheapest to keep alive), then a stable
+         connection fingerprint, so the winner does not move between rounds;
+      3. sort the winners by fingerprint for deterministic output.
+    """
     by_exit = {}
     for item in measurements:
-        # Deduplicate by measured exit only. SS is preferred WITHIN an exit
-        # group; a unique non-SS exit is retained, never globally filtered out.
-        key = (0 if str(graph.nodes[item.name].get("type", "")).lower() == "ss" else 1, graph.identity(item.name), item.name)
-        if item.ip not in by_exit or key < by_exit[item.ip][0]:
-            by_exit[item.ip] = (key, item)
+        key = (0 if str(graph.nodes[item.name].get("type", "")).lower() == "ss" else 1,
+               graph.identity(item.name), item.name)
+        bucket = egress_key(item.ip)
+        if bucket not in by_exit or key < by_exit[bucket][0]:
+            by_exit[bucket] = (key, item)
     return [value[1] for _, value in sorted(by_exit.items())]
 
 
-COUNTRY_ZH = {
-    "US": "美国", "CA": "加拿大", "GB": "英国", "DE": "德国", "FR": "法国",
-    "NL": "荷兰", "BE": "比利时", "CH": "瑞士", "AT": "奥地利", "IT": "意大利",
-    "ES": "西班牙", "PT": "葡萄牙", "SE": "瑞典", "NO": "挪威", "DK": "丹麦",
-    "FI": "芬兰", "IE": "爱尔兰", "PL": "波兰", "CZ": "捷克", "RO": "罗马尼亚",
-    "RU": "俄罗斯", "UA": "乌克兰", "TR": "土耳其", "IL": "以色列", "AE": "阿联酋",
-    "IN": "印度", "JP": "日本", "KR": "韩国", "SG": "新加坡", "HK": "香港",
-    "TW": "台湾", "MO": "澳门", "MY": "马来西亚", "TH": "泰国", "VN": "越南",
-    "ID": "印度尼西亚", "PH": "菲律宾", "AU": "澳大利亚", "NZ": "新西兰",
-    "BR": "巴西", "AR": "阿根廷", "MX": "墨西哥", "ZA": "南非", "CN": "中国",
-}
-ASN_SHORT = {
-    13335: "Cloudflare", 16509: "AWS", 15169: "Google", 8075: "Microsoft",
-    6939: "HE", 24940: "Hetzner", 14061: "DigitalOcean", 16276: "OVH",
-    12876: "Scaleway", 9009: "M247", 51167: "Contabo", 197540: "Netcup",
-    20473: "Vultr", 63949: "Linode", 45102: "Alibaba", 132203: "Tencent",
-    4134: "Chinanet", 4837: "Unicom", 9808: "ChinaMobile", 9929: "Unicom",
-}
-GEO_CACHE = {}
+COUNTRY_ZH = geo_naming.COUNTRY_ZH
 
 
 def _flag(cc):
-    cc = (cc or "").upper()
-    if len(cc) != 2 or not cc.isalpha():
-        return ""
-    return chr(0x1F1E6 + ord(cc[0]) - 65) + chr(0x1F1E6 + ord(cc[1]) - 65)
+    return geo_naming._flag(cc)
 
 
-def _org_short(value):
-    value = re.sub(r"\b(inc|llc|ltd|limited|corp|corporation|co|company|gmbh|sarl|plc)\b", "", str(value or ""), flags=re.I)
-    value = re.sub(r"[^A-Za-z0-9& -]", "", value).strip(" -")
-    words = [word for word in value.split() if word]
-    return (words[0] if words else "Unknown")[:20]
-
-
-def _geo_for_ip(ip, fallback_cc):
-    if ip in GEO_CACHE:
-        return GEO_CACHE[ip]
-    result = {"cc": (fallback_cc or "").upper(), "country": "", "city": "", "region": "", "district": "", "asn": 0, "org": ""}
-    if os.environ.get("PROBE_GEO_LOOKUP", "0") == "1":
-        try:
-            request = urllib.request.Request("https://ipwho.is/" + urllib.parse.quote(ip, safe=""), headers={"User-Agent": UA})
-            with urllib.request.urlopen(request, timeout=5) as response:
-                data = json.loads(response.read().decode("utf-8", "replace"))
-            if data.get("success") is not False:
-                result.update({
-                    "cc": str(data.get("country_code") or result["cc"]).upper(),
-                    "country": str(data.get("country") or ""),
-                    "city": str(data.get("city") or ""),
-                    "region": str(data.get("region") or ""),
-                    "district": str(data.get("district") or ""),
-                    "asn": int((data.get("connection") or {}).get("asn") or 0),
-                    "org": str((data.get("connection") or {}).get("org") or ""),
-                })
-        except (OSError, ValueError, TypeError, urllib.error.URLError):
-            pass
-    GEO_CACHE[ip] = result
-    return result
+def _display_parts(measurement):
+    """Candidate names for a measurement, most specific first."""
+    return geo_naming.RESOLVER.display_parts(measurement.ip, measurement.cc)
 
 
 def _display_name(measurement):
-    geo = _geo_for_ip(measurement.ip, measurement.cc)
-    cc = geo["cc"] or measurement.cc.upper()
-    country = COUNTRY_ZH.get(cc) or geo["country"] or cc or "未知"
-    asn = geo["asn"]
-    org = ASN_SHORT.get(asn) or _org_short(geo["org"])
-    address = geo["district"] or geo["city"] or geo["region"] or "未知地址"
-    # Display format: flag+country-organization-short-name-lowest-geo.
-    # Keep ASN numbers out of names; the organization abbreviation is enough.
-    return "-".join(part for part in (_flag(cc) + country, org, address) if part)
+    return _display_parts(measurement)[0]
 
 
 def _prefetch_geo(measurements):
-    unique = {}
-    for item in measurements:
-        unique.setdefault(item.ip, item.cc)
-    if len(unique) <= 1:
-        for ip, cc in unique.items():
-            _geo_for_ip(ip, cc)
-        return
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(unique))) as pool:
-        list(pool.map(lambda pair: _geo_for_ip(pair[0], pair[1]), unique.items()))
+    geo_naming.prefetch([(item.ip, item.cc) for item in measurements])
+
+
+def _suffix(ip, width=3):
+    """Stable short discriminator for an exit.
+
+    A repeated display name must never fall back to a sequential counter: the
+    old ``-2``/``-3`` numbers depended on how many siblings were alive, so the
+    same node changed name between rounds. This is derived from the egress
+    address only and is separated by ``@`` so it can never be confused with a
+    counter.
+    """
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    value = int(digest(egress_key(ip))[:12], 16)
+    out = ""
+    for _ in range(width):
+        value, rem = divmod(value, len(alphabet))
+        out = alphabet[rem] + out
+    return "@" + out
 
 
 def source_output(source, graph, measurements):
@@ -612,20 +593,34 @@ def source_output(source, graph, measurements):
     roots = [item.name for item in selected]
     nodes, groups = graph.closure(roots)
     namespace = digest(source)[:16]
-    label = re.sub(r"[^A-Za-z0-9]+", "-", source).strip("-")[:24] or "SOURCE"
-    label += "-" + namespace
     names = {name: "__front-" + namespace + "-" + graph.identity(name)[:20] for name in nodes}
     names.update({name: "G-" + namespace + "-" + graph.identity(name)[:20] for name in groups})
-    for item in selected:
-        names[item.name] = _display_name(item)
-    # Duplicate connections within a source remain present for non-GlaDOS sources;
-    # stable suffixes avoid invalid duplicate names without including upstream names.
-    used = {}
-    for name in sorted(names, key=lambda n: (names[n], n)):
-        value = names[name]
-        used[value] = used.get(value, 0) + 1
-        if used[value] > 1:
-            names[name] += "-" + str(used[value])
+    exit_of = {item.name: item.ip for item in selected}
+    candidates = {item.name: _display_parts(item) for item in selected}
+    # Names must be unique inside one subscription, but a counter is the worst
+    # possible disambiguator: it changes whenever a sibling dies. Walk from the
+    # most specific geographic candidate to the least specific one and take the
+    # first that is still free; only if every level collides does a stable
+    # per-exit fingerprint get appended.
+    taken = set()
+    for item in sorted(selected, key=lambda entry: (len(candidates[entry.name]),
+                                                    candidates[entry.name][0],
+                                                    entry.name)):
+        chosen = ""
+        for candidate in candidates[item.name]:
+            if candidate not in taken:
+                chosen = candidate
+                break
+        if not chosen:
+            chosen = candidates[item.name][-1]
+            unique = chosen + _suffix(exit_of[item.name])
+            index = 2
+            while unique in taken:
+                unique = chosen + _suffix(exit_of[item.name]) + str(index)
+                index += 1
+            chosen = unique
+        taken.add(chosen)
+        names[item.name] = chosen
     return canonical(graph.export(roots, names)), len(selected)
 
 
@@ -636,7 +631,7 @@ def measure_source(name, config, front, probe):
         roots = [item["name"] for item in config["proxies"]]
         measurements, invalid = probe(graph, roots)
         result.alive = len(measurements)
-        result.unique_egress = len({item.ip for item in measurements})
+        result.unique_egress = len({egress_key(item.ip) for item in measurements})
         for item in measurements:
             result.countries[item.cc] = result.countries.get(item.cc, 0) + 1
         # A missing dependency is a per-node validation failure, never stripped.

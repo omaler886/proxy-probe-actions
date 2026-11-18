@@ -24,9 +24,15 @@ def node(name="node", proto="ss", server="example.invalid", **kwargs):
 
 
 def candidate(source="airport", count=1):
+    """A source whose ``count`` nodes each measure a DISTINCT egress address.
+
+    Distinct exits matter: measurement selection now collapses one surviving
+    node per IPv4 egress for every source, so a fixture that reuses a single
+    address cannot express "count nodes published".
+    """
     config = {"proxies": [node("n" + str(i), server="s" + str(i) + ".invalid") for i in range(count)]}
     graph = p.Graph(config)
-    measurements = [p.Measurement(n["name"], "8.8.8.8", "US") for n in config["proxies"]]
+    measurements = [p.Measurement(n["name"], "8.8.8." + str(i + 1), "US") for i, n in enumerate(config["proxies"])]
     text, published = p.source_output(source, graph, measurements)
     return p.SourceResult(source, count, count, published, text)
 
@@ -105,15 +111,39 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(filename, p.source_file(name))
         self.assertNotEqual(p.source_file("A"), p.source_file("a"))
 
-    def test_glados_ss_preference_other_sources_keep_every_node(self):
+    def test_glados_ss_preference_other_sources_keep_every_distinct_exit(self):
         graph = p.Graph({"proxies": [node("v", "vmess"), node("s2", "ss", "b.invalid"), node("s1", "ss", "a.invalid")]})
+        # Same egress for all three: exactly one survivor, SS preferred.
         measurements = [p.Measurement(n, "8.8.8.8", "US") for n in ("v", "s2", "s1")]
         chosen = p.choose_measurements("GlaDOS", graph, measurements)
         self.assertEqual(len(chosen), 1)
         self.assertEqual(graph.nodes[chosen[0].name]["type"], "ss")
         self.assertEqual(chosen, p.choose_measurements("glados", graph, measurements[::-1]))
-        self.assertEqual(len(p.choose_measurements("another", graph, measurements)), 3)
-        self.assertEqual(len(p.choose_measurements("glados-pro", graph, measurements)), 3)
+        # Non-GlaDOS sources dedup by egress too (no per-source exception).
+        self.assertEqual(len(p.choose_measurements("another", graph, measurements)), 1)
+        self.assertEqual(len(p.choose_measurements("glados-pro", graph, measurements)), 1)
+
+    def test_every_source_dedups_one_node_per_ipv4_egress(self):
+        """The old contract kept duplicates for all sources but GlaDOS, which
+        is what produced -2/-3/-4 names for one and the same exit address."""
+        graph = p.Graph({"proxies": [node("a", "vmess"), node("b", "trojan"),
+                                     node("c", "ss", "c.invalid")]})
+        measurements = [p.Measurement("a", "8.8.8.8", "US"),
+                        p.Measurement("b", "8.8.8.8", "US"),
+                        p.Measurement("c", "8.8.8.8", "US")]
+        for source in ("glados", "airport", "prologue", "健康中心", "masque"):
+            with self.subTest(source=source):
+                chosen = p.choose_measurements(source, graph, measurements)
+                self.assertEqual(len(chosen), 1)
+                self.assertEqual(chosen[0].name, "c")  # ss preferred inside a group
+
+    def test_ipv6_and_ipv4_egress_both_used_as_dedup_key(self):
+        self.assertEqual(p.egress_key("8.8.8.8"), "8.8.8.8")
+        self.assertEqual(p.egress_key("2001:4860:4860::8888"), "2001:4860:4860::8888")
+        graph = p.Graph({"proxies": [node("v4"), node("v6", "vmess", "v6.invalid")]})
+        measurements = [p.Measurement("v4", "8.8.8.8", "US"),
+                        p.Measurement("v6", "2001:4860:4860::8888", "US")]
+        self.assertEqual(len(p.choose_measurements("airport", graph, measurements)), 2)
 
     def test_glados_without_ss_keeps_deterministic_one_per_exit(self):
         graph = p.Graph({"proxies": [node("a", "vmess"), node("b", "trojan")]})
@@ -128,7 +158,7 @@ class SelectionTests(unittest.TestCase):
                         p.Measurement("unique-anytls", "1.1.1.1", "AU")]
         chosen = p.choose_measurements("glados", graph, measurements)
         self.assertEqual({item.name for item in chosen}, {"ss-shared", "unique-anytls"})
-        self.assertEqual(len(p.choose_measurements("another", graph, measurements)), 3)
+        self.assertEqual(len(p.choose_measurements("another", graph, measurements)), 2)
 
     def test_names_stable_without_upstream_name_or_latency(self):
         graph = p.Graph({"proxies": [node("upstream secret")]})
@@ -139,7 +169,36 @@ class SelectionTests(unittest.TestCase):
         self.assertNotIn("upstream", first)
         renamed_name = yaml.safe_load(first)["proxies"][0]["name"]
         self.assertTrue(renamed_name.startswith("🇺🇸美国-"))
-        self.assertIn("-Unknown-未知地址", renamed_name)
+        # Offline geolocation has no ASN and no city: country-Unknown only,
+        # never a fabricated "未知地址" segment.
+        self.assertEqual(renamed_name, "🇺🇸美国-Unknown")
+
+    def test_collision_suffix_is_a_stable_exit_discriminator_not_a_counter(self):
+        """Sibling count must not change a node's suffix (old -2/-3 did)."""
+        graph = p.Graph({"proxies": [node("a", "ss", "a.invalid"), node("b", "ss", "b.invalid"),
+                                     node("c", "ss", "c.invalid")]})
+        both = [p.Measurement("a", "8.8.8.8", "US"), p.Measurement("b", "8.8.4.4", "US")]
+        allthree = both + [p.Measurement("c", "9.9.9.9", "US")]
+        # All three measure the same cc with no geolocation, so they collide on
+        # "🇺🇸美国-Unknown"; each gets its own stable discriminator.
+        text_small, _ = p.source_output("airport", graph, both)
+        text_large, _ = p.source_output("airport", graph, allthree)
+        small = {n["server"]: n["name"] for n in yaml.safe_load(text_small)["proxies"]}
+        large = {n["server"]: n["name"] for n in yaml.safe_load(text_large)["proxies"]}
+        self.assertEqual(small["a.invalid"], large["a.invalid"])
+        self.assertEqual(small["b.invalid"], large["b.invalid"])
+        for name in large.values():
+            self.assertNotRegex(name, r"-\d+$")
+
+    def test_duplicate_display_names_never_use_sequential_numbers(self):
+        graph = p.Graph({"proxies": [node("n%d" % i, "ss", "s%d.invalid" % i) for i in range(5)]})
+        measurements = [p.Measurement("n%d" % i, "10.0.0.%d" % (i + 1), "US") for i in range(5)]
+        text, published = p.source_output("airport", graph, measurements)
+        self.assertEqual(published, 5)
+        names = [item["name"] for item in yaml.safe_load(text)["proxies"]]
+        self.assertEqual(len(set(names)), 5)
+        for name in names:
+            self.assertNotRegex(name, r"-\d+$")
 
 
 class DependencyTests(unittest.TestCase):
@@ -153,8 +212,8 @@ class DependencyTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in config["proxies"]], ["same", "same", "same"])
         graph = p.Graph(deduped)
         self.assertEqual(len(graph.nodes), 3)
-        # A source with duplicated names still publishes every measured node.
-        measurements = [p.Measurement(name, "8.8.8.8", "US") for name in names]
+        # A source with duplicated names still publishes every DISTINCT exit.
+        measurements = [p.Measurement(name, "8.8.8." + str(i + 1), "US") for i, name in enumerate(names)]
         text, published = p.source_output("airport", graph, measurements)
         self.assertEqual(published, 3)
         self.assertEqual(len(yaml.safe_load(text)["proxies"]), 3)

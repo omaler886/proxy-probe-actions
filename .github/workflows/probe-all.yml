@@ -41,6 +41,28 @@ jobs:
           gzip -dc "$RUNNER_TEMP/bin/mihomo.gz" > "$RUNNER_TEMP/bin/mihomo"
           chmod 700 "$RUNNER_TEMP/bin/mihomo"
           "$RUNNER_TEMP/bin/mihomo" -v
+      - name: Fetch local ASN database
+        shell: bash
+        run: |
+          set -euo pipefail
+          # DB-IP ASN lite (CC-BY): plain CSV, IPv4 + IPv6, no API key, no rate
+          # limit. This is the offline ASN layer; a blocked DoH endpoint or a
+          # throttled ip-api must not cost us the ASN segment of every name.
+          month="$(date -u +%Y-%m)"
+          url="https://download.db-ip.com/free/dbip-asn-lite-${month}.csv.gz"
+          mkdir -p "$RUNNER_TEMP/asndb"
+          if ! curl --fail --silent --show-error --location --retry 3 --max-time 300 \
+                 "$url" -o "$RUNNER_TEMP/asndb/asn.csv.gz"; then
+            prev="$(date -u -d '1 month ago' +%Y-%m)"
+            curl --fail --silent --show-error --location --retry 3 --max-time 300 \
+              "https://download.db-ip.com/free/dbip-asn-lite-${prev}.csv.gz" \
+              -o "$RUNNER_TEMP/asndb/asn.csv.gz"
+          fi
+          # Sanity: the dump is a headerless "start,end,asn,org" CSV. Reject an
+          # HTML error page or a truncated download before it poisons ASN naming.
+          gzip -dc "$RUNNER_TEMP/asndb/asn.csv.gz" | head -n 2
+          test "$(gzip -dc "$RUNNER_TEMP/asndb/asn.csv.gz" | head -n 1 | awk -F, '{print NF}')" -ge 4
+          echo "PROBE_ASN_CSV=$RUNNER_TEMP/asndb/asn.csv.gz" >> "$GITHUB_ENV"
       - name: Verify Gist read access before spending measurement time
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
