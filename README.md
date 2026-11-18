@@ -13,7 +13,7 @@ Private execution repository. Subscription data and API tokens never belong in G
 
 ## Trigger / cadence
 
-Actions → **All subscription probes** → Run workflow. Scheduled every six hours at minute 23 (UTC), with one run at a time. GitHub scheduled execution is best effort and may be delayed. Runner location/reachability is different from HK/CN/LXC; an IPv6-only or location-restricted node may fail from GitHub even when reachable elsewhere.
+Actions → **All subscription probes** → Run workflow. The optional `sources_json` input accepts a JSON list (for example `["ikunkun","pokenmen","健康中心","prologue","233pio","saki","glados"]`); duplicates are removed. An empty input keeps the full-source schedule. Scheduled every six hours at minute 23 (UTC), with one run at a time. GitHub scheduled execution is best effort and may be delayed. Runner location/reachability is different from HK/CN/LXC; an IPv6-only or location-restricted node may fail from GitHub even when reachable elsewhere.
 
 ## Secrets
 
