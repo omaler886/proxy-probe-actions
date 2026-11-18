@@ -605,7 +605,7 @@ def source_output(source, graph, measurements):
     taken = set()
     for item in sorted(selected, key=lambda entry: (len(candidates[entry.name]),
                                                     candidates[entry.name][0],
-                                                    entry.name)):
+                                                    egress_key(exit_of[entry.name]))):
         chosen = ""
         for candidate in candidates[item.name]:
             if candidate not in taken:

@@ -13,9 +13,11 @@ Root causes this module replaces (all three were visible in production):
     (``origin.asn.cymru.com`` / ``origin6`` TXT over DoH: no API key, no
     per-IP quota, IPv4 **and** IPv6 coverage), with ip-api ``asname`` and
     ipwho as fallbacks.
-  * Country came from one source only. It is now a majority vote over
-    trace(CF) / Cymru / ip-api / ipwho, anchored Cymru > ip-api > ipwho >
-    trace, so a single wrong database cannot flip a node's country.
+  * Country is a majority vote over trace(CF) / ip-api / ipwho. Team Cymru
+    deliberately does NOT vote on country: its TXT record reports the RIR
+    registry country, not where the address is used, so it calls an AWS
+    Sydney egress "US" (AS16509 is registered in the United States). Cymru
+    supplies the ASN only, which is exactly what its data is good for.
 
 Design rules:
   * Offline by default (``PROBE_GEO_LOOKUP`` unset): no network at all, names
@@ -141,23 +143,18 @@ def _flag(cc):
 # Simplified elsewhere, so these are transliterated. Only characters that
 # actually appear in place names are mapped; anything else passes through.
 _T2S = str.maketrans({
-    "環": "环", "觀": "观", "灣": "湾", "區": "区", "門": "门", "龍": "龙",
-    "馬": "马", "黃": "黄", "鑽": "钻", "頭": "头", "藍": "蓝", "將": "将",
-    "軍": "军", "嶺": "岭", "錦": "锦", "羅": "罗", "貢": "贡", "離": "离",
-    "島": "岛", "東": "东", "臺": "台", "縣": "县", "鄉": "乡", "鎮": "镇",
-    "莊": "庄", "園": "园", "樓": "楼", "圍": "围", "徑": "径", "篤": "笃",
-    "鰂": "鲗", "魚": "鱼", "銅": "铜", "鑼": "锣", "紅": "红", "磡": "磡",
-    "荃": "荃", "涌": "涌", "湧": "涌", "坳": "坳", "埔": "埔", "粉": "粉",
-    "赤": "赤", "鱲": "鱲", "硤": "硖", "筲": "筲", "箕": "箕", "轆": "辘",
-    "欖": "榄", "蠔": "蚝", "貝": "贝", "澳": "澳", "氹": "氹", "路": "路",
-    "環": "环", "青": "青", "衣": "衣", "塘": "塘", "蒲": "蒲", "崗": "岗",
-    "埗": "埗", "長": "长", "沙": "沙", "荔": "荔", "枝": "枝", "角": "角",
-    "跑": "跑", "馬": "马", "地": "地", "鰂": "鲗", "涌": "涌", "柴": "柴",
-    "鞍": "鞍", "山": "山", "芳": "芳", "牛": "牛", "仙": "仙", "石": "石",
-    "新": "新", "深": "深", "水": "水", "台": "台", "台": "台", "莊": "庄",
-    "圍": "围", "里": "里", "仔": "仔", "邊": "边", "華": "华", "僑": "侨",
-    "僑": "侨", "國": "国", "際": "际", "電": "电", "訊": "讯", "網": "网",
-    "絡": "络", "數": "数", "據": "据", "雲": "云", "機": "机", "廠": "厂",
+    "環": "环", "觀": "观", "灣": "湾", "區": "区", "門": "门", "龍": "龙", "馬": "马", "黃": "黄",
+    "鑽": "钻", "頭": "头", "藍": "蓝", "將": "将", "軍": "军", "嶺": "岭", "錦": "锦", "羅": "罗",
+    "貢": "贡", "離": "离", "島": "岛", "東": "东", "臺": "台", "縣": "县", "鄉": "乡", "鎮": "镇",
+    "莊": "庄", "園": "园", "樓": "楼", "圍": "围", "徑": "径", "篤": "笃", "鰂": "鲗", "魚": "鱼",
+    "銅": "铜", "鑼": "锣", "紅": "红", "湧": "涌", "硤": "硖", "轆": "辘", "欖": "榄", "蠔": "蚝",
+    "貝": "贝", "崗": "岗", "長": "长", "邊": "边", "華": "华", "僑": "侨", "國": "国", "際": "际",
+    "電": "电", "訊": "讯", "網": "网", "絡": "络", "數": "数", "據": "据", "雲": "云", "機": "机",
+    "廠": "厂", "維": "维", "亞": "亚", "聖": "圣", "爾": "尔", "薩": "萨", "蘭": "兰", "釗": "钊",
+    "賓": "宾", "蘇": "苏", "聯": "联", "體": "体", "歐": "欧", "義": "义", "達": "达", "魯": "鲁",
+    "賽": "赛", "萬": "万", "圖": "图", "盧": "卢", "茲": "兹", "漢": "汉", "諾": "诺", "麥": "麦",
+    "倫": "伦", "納": "纳", "庫": "库", "頁": "页", "熱": "热", "內": "内", "濃": "浓", "紐": "纽",
+    "約": "约", "頓": "顿", "喬": "乔", "鳳": "凤",
 })
 
 
@@ -294,7 +291,11 @@ def _org_brand(raw, asn=0):
 
 
 def _majority(votes):
-    """Majority vote with a fixed authority order: Cymru > ip-api > ipwho > trace."""
+    """Majority vote with a fixed authority order: ip-api > ipwho > trace.
+
+    Two votes always beat one, so a stale trace or a blocked ip-api cannot flip
+    a country on its own; a full tie falls back to the listed order.
+    """
     votes = [(src, cc) for src, cc in votes if cc]
     if not votes:
         return ""
@@ -493,9 +494,9 @@ class Resolver:
                 # endpoint would otherwise lose.
                 entry["asn"] = (cy_asn or db_asn or pa.get("asn")
                                 or wh.get("asn") or 0)
-                entry["cc"] = _majority([("cymru", cy_cc), ("ipapi", pa.get("cc")),
-                                         ("ipwho", wh.get("cc")),
-                                         ("trace", (fallback or "").upper())])
+                entry["cc"] = _majority([("trace", (fallback or "").upper()),
+                                         ("ipapi", pa.get("cc")),
+                                         ("ipwho", wh.get("cc"))])
                 entry["org"] = _org_brand(pa.get("asname") or wh.get("org") or "",
                                           entry["asn"])
                 entry["city"] = (pa.get("city")

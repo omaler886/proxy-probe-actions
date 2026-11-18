@@ -45,20 +45,20 @@ class BrandTests(unittest.TestCase):
 
 class VoteTests(unittest.TestCase):
     def test_majority_wins(self):
-        self.assertEqual(g._majority([("cymru", "HK"), ("ipapi", "HK"), ("ipwho", "CN")]), "HK")
+        self.assertEqual(g._majority([("ipapi", "HK"), ("ipwho", "HK"), ("trace", "CN")]), "HK")
 
     def test_full_tie_follows_authority_order(self):
-        # One vote each: Cymru is first in the list, so it anchors.
-        self.assertEqual(g._majority([("cymru", "HK"), ("ipapi", "CN"), ("ipwho", "TW")]), "HK")
+        # One vote each: ip-api is first in the list, so it anchors.
+        self.assertEqual(g._majority([("ipapi", "HK"), ("ipwho", "CN"), ("trace", "TW")]), "HK")
 
     def test_blank_votes_are_ignored(self):
-        self.assertEqual(g._majority([("cymru", ""), ("ipapi", "US"), ("ipwho", "")]), "US")
+        self.assertEqual(g._majority([("ipapi", ""), ("ipwho", "US"), ("trace", "")]), "US")
         self.assertEqual(g._majority([]), "")
 
     def test_single_wrong_database_cannot_flip_a_country(self):
-        # trace + cymru + ipapi agree; one bad ipwho vote loses.
+        # ip-api + ipwho agree; one bad trace vote loses.
         self.assertEqual(
-            g._majority([("trace", "US"), ("cymru", "US"), ("ipapi", "US"), ("ipwho", "DE")]), "US")
+            g._majority([("trace", "DE"), ("ipapi", "US"), ("ipwho", "US")]), "US")
 
 
 class DisplayTests(unittest.TestCase):
@@ -154,17 +154,26 @@ class OfflinePrefetchTests(unittest.TestCase):
         self.assertEqual(entry["org"], "HKT")
         self.assertEqual(entry["asn"], 4760)
 
-    def test_cymru_cc_only_when_asn_missing_still_votes(self):
+    def test_cymru_cc_is_deliberately_not_a_country_vote(self):
+        """Cymru reports the RIR registry country, not the usage location.
+
+        AWS registers AS16509 in the US, so a Cymru vote would label an AWS
+        Sydney egress "US". Only the ASN may come from Cymru.
+        """
         original = (g.cymru_asn_cc, g._ipapi_batch, g._ipwho, g.LOOKUP_ON)
-        g.cymru_asn_cc = lambda ip: (0, "TW")
+        g.cymru_asn_cc = lambda ip: (16509, "US")
         g._ipapi_batch = lambda ips: {}
-        g._ipwho = lambda ip: None
+        g._ipwho = lambda ip: {"cc": "AU", "city": "Sydney", "region": "",
+                               "zone": "", "country": "Australia", "asn": 16509,
+                               "org": "Amazon.com, Inc."}
         g.LOOKUP_ON = True
         try:
-            g.prefetch([("1.2.3.4", "")])
+            g.prefetch([("13.55.52.44", "AU")])
+            entry = g.RESOLVER.entry("13.55.52.44")
         finally:
             g.cymru_asn_cc, g._ipapi_batch, g._ipwho, g.LOOKUP_ON = original
-        self.assertEqual(g.RESOLVER.entry("1.2.3.4")["cc"], "TW")
+        self.assertEqual(entry["asn"], 16509)
+        self.assertEqual(entry["cc"], "AU")
 
 
 class CymruParseTests(unittest.TestCase):

@@ -190,6 +190,23 @@ class SelectionTests(unittest.TestCase):
         for name in large.values():
             self.assertNotRegex(name, r"-\d+$")
 
+    def test_collision_names_do_not_depend_on_upstream_node_name(self):
+        """Renaming an upstream node must not move anybody else's name."""
+        first = p.Graph({"proxies": [node("alpha", "ss", "a.invalid"),
+                                     node("beta", "ss", "b.invalid")]})
+        second = p.Graph({"proxies": [node("zzz", "ss", "a.invalid"),
+                                      node("yyy", "ss", "b.invalid")]})
+        measurements = [p.Measurement("alpha", "8.8.8.8", "US"),
+                        p.Measurement("beta", "9.9.9.9", "US")]
+        renamed = [p.Measurement("zzz", "8.8.8.8", "US"),
+                   p.Measurement("yyy", "9.9.9.9", "US")]
+        by_server = {}
+        for text in (p.source_output("airport", first, measurements)[0],
+                     p.source_output("airport", second, renamed)[0]):
+            by_server.setdefault("run", []).append(
+                {n["server"]: n["name"] for n in yaml.safe_load(text)["proxies"]})
+        self.assertEqual(by_server["run"][0], by_server["run"][1])
+
     def test_duplicate_display_names_never_use_sequential_numbers(self):
         graph = p.Graph({"proxies": [node("n%d" % i, "ss", "s%d.invalid" % i) for i in range(5)]})
         measurements = [p.Measurement("n%d" % i, "10.0.0.%d" % (i + 1), "US") for i in range(5)]
