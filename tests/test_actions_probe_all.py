@@ -255,6 +255,35 @@ class PublisherTests(unittest.TestCase):
         self.assertIn(p.source_file(names[1]), remote.patches[0])
         self.assertIn("manifest.json", remote.patches[0])
 
+    def test_token_and_gist_id_outer_whitespace_stripped(self):
+        remote = FakeGist(self.old)
+        publisher = p.GistPublisher("  abc123\r\n", "  test-token\r\n", remote)
+        publisher.publish([self.initial])
+        self.assertEqual(remote.calls[0][2]["Authorization"], "Bearer test-token")
+        self.assertEqual(remote.calls[0][1], "https://api.github.com/gists/abc123")
+        for token in ("\r\n", "bad\r\ntoken"):
+            with self.assertRaises(p.ProbeError):
+                p.GistPublisher("abc123", token, remote)
+
+    def test_412_rereads_and_replans_bounded(self):
+        remote = FakeGist(self.old)
+        conflicts = [True]
+        calls = []
+        def transport(method, url, headers=None, body=None):
+            calls.append(method)
+            if method == "PATCH" and conflicts:
+                conflicts.pop()
+                raise p.ProbeError("http_412")
+            return remote(method, url, headers, body)
+        self.assertEqual(self.publisher(transport).publish([candidate(count=5)])[0], "published")
+        self.assertEqual(calls, ["GET", "PATCH", "GET", "PATCH"])
+        def always_conflict(method, url, headers=None, body=None):
+            if method == "PATCH":
+                raise p.ProbeError("http_412")
+            return remote(method, url, headers, body)
+        with self.assertRaises(p.ProbeError):
+            self.publisher(always_conflict).publish([candidate(count=6)])
+
     def test_half_previous_is_accepted(self):
         remote = FakeGist(self.old)
         self.assertEqual(self.publisher(remote).publish([candidate(count=2)])[0], "published")
@@ -371,7 +400,67 @@ class NativeTests(unittest.TestCase):
         start.assert_not_called()
 
 
+class TransportTests(unittest.TestCase):
+    def test_retry_503_and_oserror_but_not_401_403_412(self):
+        for code, attempts in ((503, 3), (429, 3), (401, 1), (403, 1), (412, 1)):
+            transport = p.Transport(sleep=lambda _: None)
+            failure = p.urllib.error.HTTPError("https://fixture.invalid/SECRET", code, "SECRET", {}, None)
+            with mock.patch.object(transport.opener, "open", side_effect=failure) as opened:
+                with self.assertRaises(p.ProbeError) as got:
+                    transport("GET", "https://fixture.invalid/SECRET")
+                self.assertEqual(p.error_code(got.exception), "http_" + str(code))
+                self.assertEqual(opened.call_count, attempts)
+        transport = p.Transport(sleep=lambda _: None)
+        with mock.patch.object(transport.opener, "open", side_effect=OSError("SECRET")) as opened:
+            with self.assertRaises(p.ProbeError):
+                transport("PATCH", "https://fixture.invalid/SECRET", body=b"{}")
+            self.assertEqual(opened.call_count, 3)
+
+    def test_error_categories_never_include_exception_text(self):
+        for exc in (ValueError("SECRET URL"), p.ProbeError("SECRET URL"), KeyError("SECRET URL"), RuntimeError("SECRET URL")):
+            self.assertNotIn("SECRET", p.error_code(exc))
+            self.assertNotIn("URL", p.error_code(exc))
+
+
 class RunnerTests(unittest.TestCase):
+    def test_selected_sources_dedup_clashmeta_and_private_checkpoint_on_publish_failure(self):
+        calls = []
+        names = ["ikunkun", "pokenmen", "健康中心", "prologue", "233pio", "saki", "glados"]
+        def transport(method, url, headers=None, body=None):
+            calls.append(url)
+            if url.startswith("https://api.github.com/"):
+                raise p.ProbeError("http_403")
+            if url.endswith("/api/subs"):
+                return json.dumps({"data": [{"name": name} for name in names + ["not-selected"]]}).encode(), {}
+            self.assertIn("?target=ClashMeta", url)
+            return p.canonical({"proxies": [node()]}).encode(), {}
+        def probe(graph, roots):
+            return [p.Measurement(name, "8.8.8.8", "US") for name in roots], 0
+        with tempfile.TemporaryDirectory() as temp:
+            env = {"SUBSTORE_BASE": "https://fixture.invalid/SECRET", "PROBE_OUTPUT_DIR": temp, "GIST_TOKEN": "fixture\r\n", "GIST_ID": "abc123", "PROBE_FRONT_SUB": "", "PROBE_SOURCES_JSON": json.dumps(names + ["prologue"])}
+            code, summary = p.run(env, transport, probe)
+            self.assertEqual(code, 2)
+            self.assertEqual(summary["phase"], "publish")
+            self.assertEqual(summary["error_code"], "http_403")
+            self.assertEqual(summary["sources"], 7)
+            self.assertEqual(summary["alive"], 7)
+            self.assertEqual([item["name"] for item in summary["results"]], names)
+            self.assertTrue(all(item["dedup_kept"] == 1 and item["unique_egress"] == 1 and item["countries"] == {"US": 1} for item in summary["results"]))
+            self.assertEqual(len(list((Path(temp) / "candidates").glob("source-*.yaml"))), 7)
+            report = json.loads((Path(temp) / "measurement.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["alive"], 7)
+            self.assertNotIn("SECRET", json.dumps(summary))
+            self.assertEqual(len(calls), 9)
+
+    def test_source_filter_missing_or_invalid_fails_before_download(self):
+        for selected in ('[]', '{}', '["missing"]', '["airport", 3]', 'invalid'):
+            with self.subTest(selected=selected), tempfile.TemporaryDirectory() as temp:
+                transport = mock.Mock(return_value=(b'{"data":[{"name":"airport"}]}', {}))
+                code, summary = p.run({"SUBSTORE_BASE": "https://fixture.invalid/private", "PROBE_OUTPUT_DIR": temp, "PROBE_SOURCES_JSON": selected}, transport, mock.Mock())
+                self.assertEqual(code, 2)
+                self.assertIn(summary["error_code"], {"sources_filter_invalid", "sources_filter_missing"})
+                self.assertEqual(transport.call_count, 1)
+
     def test_all_sources_every_round_without_names_in_summary(self):
         calls = []
         names = ["first", "second", "cf-front", "probe-old", "chain-old", "rust-old", "官方可用", "测活-DMIT"]
@@ -391,7 +480,9 @@ class RunnerTests(unittest.TestCase):
             for _ in range(2):
                 code, summary = p.run(env, transport, probe)
                 self.assertEqual(code, 0)
-                self.assertEqual(summary, {"sources": 3, "input": 3, "alive": 3, "failure": 0})
+                self.assertEqual({key: summary[key] for key in ("sources", "input", "alive", "failure")}, {"sources": 3, "input": 3, "alive": 3, "failure": 0})
+                self.assertEqual(summary["phase"], "complete")
+                self.assertNotIn("results", summary)
             self.assertEqual(len(calls), 8)
             self.assertEqual(len(list(Path(temp).glob("source-*.yaml"))), 3)
             self.assertTrue((Path(temp) / "mihomo-alive.yaml").exists())

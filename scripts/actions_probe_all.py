@@ -4,7 +4,10 @@
 Run: SUBSTORE_BASE=... MIHOMO_BIN=/path/mihomo PROBE_OUTPUT_DIR=/private/path
      python scripts/actions_probe_all.py
 Optional: GIST_TOKEN + GIST_ID (or GITHUB_GIST_ID), PROBE_CONCURRENCY=8,
-PROBE_TIMEOUT=15, PROBE_FRONT_SUB=cf-front. Output contains credentials: NEVER
+PROBE_TIMEOUT=15, PROBE_FRONT_SUB=cf-front, PROBE_SOURCES_JSON='["source"]'.
+When PROBE_SOURCES_JSON is unset, every selected source is tested every round.
+Explicitly selected source names/counts are reported; upstream names/URLs never are.
+Output contains credentials: NEVER
 upload this directory as an Actions artifact. Serialize workflow runs externally.
 Dependency groups are frozen to deterministic select groups (same complete member
 closure), preventing background health checks, fallback-to-DIRECT and latency churn.
@@ -14,7 +17,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import ipaddress
 import json
@@ -47,6 +50,20 @@ COUNTRIES = set("AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF 
 
 class ProbeError(Exception):
     """Deliberately contains only a non-sensitive category."""
+
+
+ERROR_CODES = set("trace_invalid github_redirect response_large upstream_redirect transport_failure redirect_limit base_invalid sources_invalid subscription_invalid definition_invalid definition_duplicate definition_collision dependency_invalid dependency_cycle_or_direct dependency_missing kernel_validation_failure kernel_config_failure kernel_start_failure kernel_end_failure kernel_execution_failure old_content_invalid namespace_collision manifest_invalid gist_id_invalid gist_token_invalid gist_not_private gist_raw_invalid environment_missing kernel_missing curl_missing sources_empty sources_filter_invalid sources_filter_missing no_successful_roots gist_conflict http_failure request_invalid non_proxy_outbound dependency_group_unsupported".split())
+
+
+def error_code(exc):
+    # NEVER return arbitrary exception text: parsers/urllib can include secrets.
+    if isinstance(exc, ProbeError):
+        code = exc.args[0] if exc.args else ""
+        return code if isinstance(code, str) and (code in ERROR_CODES or re.fullmatch(r"http_[1-5][0-9]{2}", code)) else "probe_error"
+    for cls in (json.JSONDecodeError, UnicodeError, KeyError, TypeError, ValueError, OSError, yaml.YAMLError):
+        if isinstance(exc, cls):
+            return cls.__name__
+    return "unexpected_exception"
 
 
 def digest(value: str | bytes) -> str:
@@ -96,11 +113,26 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class Transport:
     """Bounded responses, explicit redirect validation; injectable in offline tests."""
-    def __init__(self, timeout=30):
+    def __init__(self, timeout=30, retries=2, sleep=time.sleep):
         self.timeout = timeout
+        self.retries = max(0, min(3, int(retries)))
+        self.sleep = sleep
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
     def __call__(self, method, url, headers=None, body=None):
+        # Repeating the exact fixed-content PATCH is idempotent. A 412 is NEVER
+        # retried here: the publisher must GET and re-plan against the new ETag.
+        for attempt in range(self.retries + 1):
+            try:
+                return self.once(method, url, headers, body)
+            except ProbeError as exc:
+                code = error_code(exc)
+                retryable = code == "transport_failure" or code == "http_429" or bool(re.fullmatch(r"http_5[0-9]{2}", code))
+                if not retryable or attempt >= self.retries:
+                    raise
+                self.sleep(min(4, 2 ** attempt))
+
+    def once(self, method, url, headers=None, body=None):
         headers = dict(headers or {})
         headers.setdefault("User-Agent", UA)
         original = urllib.parse.urlsplit(url)
@@ -124,9 +156,11 @@ class Transport:
                         raise ProbeError("upstream_redirect") from None
                     url = new_url
                     continue
-                raise ProbeError("http_failure") from None
-            except (OSError, ValueError):
+                raise ProbeError("http_" + str(exc.code)) from None
+            except (OSError, urllib.error.URLError):
                 raise ProbeError("transport_failure") from None
+            except ValueError:
+                raise ProbeError("request_invalid") from None
         raise ProbeError("redirect_limit")
 
 
@@ -149,7 +183,7 @@ class SubStore:
         return sorted(names)
 
     def config(self, name):
-        raw, _ = self.transport("GET", self.base + "/download/" + urllib.parse.quote(name, safe="") + "/mihomo")
+        raw, _ = self.transport("GET", self.base + "/download/" + urllib.parse.quote(name, safe="") + "?target=ClashMeta")
         value = yaml.safe_load(raw)
         if not isinstance(value, dict) or not isinstance(value.get("proxies"), list):
             raise ProbeError("subscription_invalid")
@@ -322,6 +356,9 @@ class SourceResult:
     published: int = 0
     content: str | None = None
     failed: bool = False
+    error: str = ""
+    unique_egress: int = 0
+    countries: dict = field(default_factory=dict)
 
 
 class NativeProbe:
@@ -472,10 +509,14 @@ def measure_source(name, config, front, probe):
         roots = [item["name"] for item in config["proxies"]]
         measurements, invalid = probe(graph, roots)
         result.alive = len(measurements)
+        result.unique_egress = len({item.ip for item in measurements})
+        for item in measurements:
+            result.countries[item.cc] = result.countries.get(item.cc, 0) + 1
         # A missing dependency is a per-node validation failure, never stripped.
         result.content, result.published = source_output(name, graph, measurements)
-    except Exception:
+    except Exception as exc:
         result.failed = True
+        result.error = error_code(exc)
     return result
 
 
@@ -533,6 +574,7 @@ def plan_updates(results, old):
             doc = yaml.safe_load(effective[filename])
             prior_alive = sum(not item.get("name", "").startswith("__front-") for item in doc.get("proxies", []))
         accept = not result.failed and result.content is not None and result.alive > 0 and result.alive >= prior_alive * 0.5
+        guard = "accepted" if accept else ("source_failure" if result.failed else "zero_alive" if not result.alive else "ratio_drop" if result.alive < prior_alive * 0.5 else "candidate_invalid")
         if accept:
             try:
                 candidate = yaml.safe_load(result.content)
@@ -543,13 +585,15 @@ def plan_updates(results, old):
                 accept = bool(roots) and len(roots) == result.published and result.published <= result.alive
             except Exception:
                 accept = False
+            if not accept:
+                guard = "candidate_invalid"
         if accept:
             effective[filename] = result.content
         published = result.published if accept else last.get("published", prior_alive)
         manifest["sources"][filename] = {
             "name": result.name, "input": result.input, "alive": result.alive,
             "published": published, "last_success_alive": result.alive if accept else prior_alive,
-            "preserved": not accept,
+            "preserved": not accept, "guard": guard,
         }
     merged = merge_sources(effective) if effective else old.get("mihomo-alive.yaml", canonical({"proxies": []}))
     for filename, content in effective.items():
@@ -564,6 +608,9 @@ def plan_updates(results, old):
 
 class GistPublisher:
     def __init__(self, gist_id, token, transport):
+        gist_id, token = gist_id.strip(), token.strip()
+        if not token or any(ch.isspace() for ch in token):
+            raise ProbeError("gist_token_invalid")
         if not re.fullmatch(r"[0-9a-fA-F]{5,64}", gist_id):
             raise ProbeError("gist_id_invalid")
         self.url = "https://api.github.com/gists/" + gist_id
@@ -591,6 +638,17 @@ class GistPublisher:
         return files, headers.get("ETag", headers.get("Etag", headers.get("etag")))
 
     def publish(self, results):
+        for attempt in range(3):
+            try:
+                return self._publish_once(results)
+            except ProbeError as exc:
+                if error_code(exc) != "http_412" or attempt == 2:
+                    raise
+                # Concurrent change: discard the old plan completely and read
+                # current private state again before constructing another PATCH.
+        raise ProbeError("gist_conflict")
+
+    def _publish_once(self, results):
         old, etag = self.current()  # No PATCH at all if any read/parse/guard fails.
         files = plan_updates(results, old)
         if not any(SOURCE_FILE.fullmatch(name) for name in files):
@@ -621,10 +679,25 @@ def read_local(directory):
     return files
 
 
+def result_reports(results, files=None):
+    entries = json.loads(files["manifest.json"]).get("sources", {}) if files else {}
+    reports = []
+    for item in results:
+        state = entries.get(source_file(item.name), {})
+        reports.append({"name": item.name, "input": item.input, "alive": item.alive,
+                        "dedup_kept": item.published, "published": state.get("published", 0),
+                        "failed": item.failed, "preserved": state.get("preserved", True),
+                        "guard": state.get("guard", "pending"), "error_code": item.error,
+                        "unique_egress": item.unique_egress, "countries": item.countries})
+    return reports
+
+
 def run(env=None, transport=None, probe=None):
     env = dict(os.environ if env is None else env)
-    results, sources = [], []
-    summary = {"sources": 0, "input": 0, "alive": 0, "failure": 0}
+    results, sources, output = [], [], None
+    requested = bool(env.get("PROBE_SOURCES_JSON", "").strip())
+    summary = {"sources": 0, "input": 0, "alive": 0, "failure": 0,
+               "phase": "init", "error_code": "", "publication": "not_started"}
     try:
         base = env.get("SUBSTORE_BASE", "").strip()
         if not base or not env.get("PROBE_OUTPUT_DIR", "").strip():
@@ -639,17 +712,30 @@ def run(env=None, transport=None, probe=None):
             if not shutil.which("curl"):
                 raise ProbeError("curl_missing")
             probe = NativeProbe(binary, env.get("PROBE_CONCURRENCY", 8), env.get("PROBE_TIMEOUT", 15))
+        summary["phase"] = "sources"
         sources = store.sources()
+        if requested:
+            try:
+                chosen = json.loads(env["PROBE_SOURCES_JSON"])
+            except (ValueError, TypeError):
+                raise ProbeError("sources_filter_invalid") from None
+            if not isinstance(chosen, list) or not chosen or not all(isinstance(name, str) and name and len(name) <= 128 and not any(ord(ch) < 32 for ch in name) for name in chosen):
+                raise ProbeError("sources_filter_invalid")
+            chosen = list(dict.fromkeys(chosen))
+            if any(name not in sources for name in chosen):
+                raise ProbeError("sources_filter_missing")
+            sources = chosen
         summary["sources"] = len(sources)
         if not sources:
             raise ProbeError("sources_empty")
-        # Fetch EVERY selected source this round, including fronts; no history skip.
+        summary["phase"] = "fetch"
+        # Fetch EVERY selected source this round; no history skip.
         configs = {}
         for name in sources:
             try:
                 configs[name] = store.config(name)
-            except Exception:
-                results.append(SourceResult(name, failed=True))
+            except Exception as exc:
+                results.append(SourceResult(name, failed=True, error=error_code(exc)))
         front_name = env.get("PROBE_FRONT_SUB", "cf-front")
         front = configs.get(front_name)
         if front is None and front_name and selected_source(front_name) and front_name not in sources:
@@ -657,28 +743,57 @@ def run(env=None, transport=None, probe=None):
                 front = store.config(front_name)
             except Exception:
                 pass  # Individual missing dependencies fail closed in Graph.
+        summary["phase"] = "measure"
         for name in sources:
             if name in configs:
                 results.append(measure_source(name, configs[name], front, probe))
+        results.sort(key=lambda item: sources.index(item.name))
         summary.update(input=sum(item.input for item in results), alive=sum(item.alive for item in results), failure=sum(item.failed or not item.alive for item in results))
+        if requested:
+            summary["results"] = result_reports(results)
+        summary["phase"] = "checkpoint"
+        # Private recovery evidence exists BEFORE any GitHub request. Candidate
+        # files never overwrite last-success source artifacts before the gates.
+        candidates = private_dir(output / "candidates")
+        for item in results:
+            if item.content is not None:
+                private_write(candidates / source_file(item.name), item.content)
+        private_write(output / "measurement.json", json_text(dict(summary, results=result_reports(results))))
         if not any(not item.failed and item.alive > 0 and item.published > 0 for item in results):
             raise ProbeError("no_successful_roots")
+        summary["phase"] = "publish"
         if env.get("GIST_TOKEN"):
             gist_id = env.get("GIST_ID", env.get("GITHUB_GIST_ID", ""))
-            _, files = GistPublisher(gist_id, env["GIST_TOKEN"], transport).publish(results)
+            status, files = GistPublisher(gist_id, env["GIST_TOKEN"], transport).publish(results)
+            summary["publication"] = status
         else:
             files = plan_updates(results, read_local(output))
+            summary["publication"] = "local_only"
+        if requested:
+            summary["results"] = result_reports(results, files)
+        summary["phase"] = "output"
         for name, content in files.items():
             private_write(output / name, content)
+        summary["phase"] = "complete"
+        private_write(output / "measurement.json", json_text(dict(summary, results=result_reports(results, files))))
         return 0 if not summary["failure"] else 1, summary
-    except Exception:
+    except Exception as exc:
         summary["failure"] = max(1, summary["failure"])
+        summary["error_code"] = error_code(exc)
+        if requested and results:
+            summary["results"] = result_reports(results)
+        if output is not None and results:
+            try:
+                private_write(output / "measurement.json", json_text(dict(summary, results=result_reports(results))))
+            except Exception:
+                pass
         return 2, summary
 
 
 def main():
     code, summary = run()
-    # The ONLY stdout record; no URLs, source names, upstream names or exceptions.
+    # The ONLY stdout record. Explicit filter names/counts may be included;
+    # never URLs, upstream node names, raw IPs or arbitrary exception text.
     print(json.dumps(summary, sort_keys=True))
     return code
 
