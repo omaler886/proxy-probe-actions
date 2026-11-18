@@ -190,12 +190,25 @@ class Graph:
         path = stack + (name,)
         if name in self.nodes:
             item = self.nodes[name]
+            # A renamed DIRECT/reject/dns outbound is not a proxy node. Otherwise
+            # the runner's own trace would become false evidence of proxy health.
+            if str(item.get("type", "")).lower() not in {
+                "ss", "ssr", "vmess", "vless", "trojan", "hysteria", "hysteria2",
+                "tuic", "wireguard", "snell", "socks5", "http", "ssh", "mieru",
+                "anytls", "masque", "trusttunnel", "sudoku",
+            }:
+                raise ProbeError("non_proxy_outbound")
             value = {k: v for k, v in item.items() if k not in ANNOTATIONS and not k.startswith("_probe")}
             ref = self.dependency(item)
             if ref:
                 value["dialer-resolved"] = self.identity(ref, path)
         elif name in self.groups:
             item = self.groups[name]
+            # Only ordinary single-hop selection groups can be frozen. A relay
+            # is an ordered multi-hop chain, not a selector; unsupported/unknown
+            # groups must fail closed instead of changing the tested path.
+            if str(item.get("type", "")).lower() not in {"select", "url-test", "fallback", "load-balance"}:
+                raise ProbeError("dependency_group_unsupported")
             refs = item.get("proxies")
             if item.get("use") or not isinstance(refs, list) or not refs:
                 raise ProbeError("dependency_missing")

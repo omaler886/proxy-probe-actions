@@ -124,6 +124,21 @@ class SelectionTests(unittest.TestCase):
 
 
 class DependencyTests(unittest.TestCase):
+    def test_named_direct_and_non_proxy_types_rejected(self):
+        for proto in ("direct", "DIRECT", "reject", "dns", "pass", "unknown"):
+            with self.subTest(proto=proto):
+                graph = p.Graph({"proxies": [node("looks-like-a-proxy", proto=proto)]})
+                with self.assertRaises(p.ProbeError):
+                    graph.identity("looks-like-a-proxy")
+
+    def test_relay_unknown_groups_not_rewritten_into_select(self):
+        for proto in ("relay", "unknown", ""):
+            with self.subTest(proto=proto):
+                graph = p.Graph({"proxies": [node("front"), node("exit", **{"dialer-proxy": "chain"})],
+                                 "proxy-groups": [{"name": "chain", "type": proto, "proxies": ["front"]}]})
+                with self.assertRaises(p.ProbeError):
+                    graph.export(["exit"])
+
     def setUp(self):
         self.front = {"proxies": [node("front-a", server="fa.invalid"), node("front-b", server="fb.invalid")], "proxy-groups": [{"name": "front-group", "type": "url-test", "url": "https://not-fetched.invalid", "proxies": ["front-b", "front-a"]}]}
         self.config = {"proxies": [node("exit", **{"dialer-proxy": "front-group"})]}
