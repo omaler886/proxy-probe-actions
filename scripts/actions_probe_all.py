@@ -578,8 +578,17 @@ def _suffix(ip, width=3):
     address only and is separated by ``@`` so it can never be confused with a
     counter.
     """
+    return _stable_tag(egress_key(ip), width)
+
+
+def _stable_tag(seed, width=3):
+    """Base36 discriminator from any stable seed (egress IP or connection fp).
+
+    The ``@`` separator keeps it distinct from a numeric suffix and from the
+    old 8-hex merger tag, so an audit can assert zero ``-N``/``-hex`` names.
+    """
     alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
-    value = int(digest(egress_key(ip))[:12], 16)
+    value = int(digest(str(seed))[:12], 16)
     out = ""
     for _ in range(width):
         value, rem = divmod(value, len(alphabet))
@@ -665,7 +674,7 @@ def merge_sources(contents):
             for item in doc.get(key, []):
                 old = target.get(item["name"])
                 if old is not None and old != item:
-                    rename[item["name"]] = item["name"] + "-" + fp[:8]
+                    rename[item["name"]] = item["name"] + _stable_tag(fp)
         if rename:
             for key in ("proxies", "proxy-groups"):
                 for item in doc.get(key, []):

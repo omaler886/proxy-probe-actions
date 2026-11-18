@@ -188,6 +188,33 @@ class FetchTests(unittest.TestCase):
             a.time.sleep = original_sleep
         self.assertEqual(len(calls), 3)
 
+    def test_retries_on_incomplete_read(self):
+        """A truncated chunked response is a transient network failure."""
+        import http.client
+        calls = []
+
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return b"complete"
+
+        def flaky(url, timeout=40):
+            calls.append(url)
+            if len(calls) < 3:
+                raise http.client.IncompleteRead(b"partial", 100)
+            return FakeResponse()
+
+        original = a.urllib.request.urlopen
+        original_sleep = a.time.sleep
+        a.urllib.request.urlopen = flaky
+        a.time.sleep = lambda seconds: None
+        try:
+            self.assertEqual(a.fetch("https://example.test/x"), b"complete")
+        finally:
+            a.urllib.request.urlopen = original
+            a.time.sleep = original_sleep
+        self.assertEqual(len(calls), 3)
+
     def test_does_not_retry_on_client_error(self):
         calls = []
 

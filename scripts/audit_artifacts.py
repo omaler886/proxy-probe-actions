@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import http.client
 import json
 import re
 import sys
@@ -72,7 +73,8 @@ def fetch(url, timeout=40, retries=4):
             last = exc
             if exc.code not in (403, 429, 500, 502, 503, 504) or attempt == retries:
                 raise
-        except (urllib.error.URLError, OSError) as exc:
+        except (urllib.error.URLError, http.client.IncompleteRead, ConnectionError, OSError) as exc:
+            # A truncated chunked response is a transient network failure.
             last = exc
             if attempt == retries:
                 raise
