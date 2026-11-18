@@ -593,8 +593,21 @@ def _display_name(measurement):
     return "-".join(part for part in (_flag(cc), country, asn_part, address) if part)
 
 
+def _prefetch_geo(measurements):
+    unique = {}
+    for item in measurements:
+        unique.setdefault(item.ip, item.cc)
+    if len(unique) <= 1:
+        for ip, cc in unique.items():
+            _geo_for_ip(ip, cc)
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(unique))) as pool:
+        list(pool.map(lambda pair: _geo_for_ip(pair[0], pair[1]), unique.items()))
+
+
 def source_output(source, graph, measurements):
     selected = choose_measurements(source, graph, measurements)
+    _prefetch_geo(selected)
     roots = [item.name for item in selected]
     nodes, groups = graph.closure(roots)
     namespace = digest(source)[:16]
