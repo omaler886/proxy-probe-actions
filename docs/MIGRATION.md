@@ -56,6 +56,40 @@ Gist 599bdba3…（public:false）
    解析不到就按失败关闭处理——**不会**把带链节点降级成直连去测（否则测的是它自己的 server，
    客户端根本不会那样用）。
 
+## 全源实测（2026-11-18，最终一轮 run 44258889966）
+
+- **42 个源 / 1483 个输入节点 / 739 个取得有效 trace / 29 个源发布 / 13 个源保旧**
+- Gist：`public:false`，29 个 `source-*.yaml` + `mihomo-alive.yaml`（**522** 条合并节点）+ `manifest.json`，
+  `hb-full.yaml` 未动；`gist-*` 自引用产物已删除。
+- 回归中修掉的两个真实缺陷：
+  1. **自引用回路**：Sub-Store 集合改成 `gist-*` 远程订阅后，下一轮把这些自己的产物当上游又测了一遍
+     （53 源 / 1793 节点）。`selected_source()` 现在排除 `gist-` 前缀。
+  2. **残留产物不清**：发布器默认保留“不在本轮列表里的远端源”，导致上一轮误测的 `gist-glados`、
+     `gist-ikunkun` 永久留在 Gist。现在自引用产物在同一次 PATCH 里以 `{"content": null}` 删除。
+
+### 13 个保旧源的原因（都不是“节点全死”）
+
+| 源 | 输入 | 判定 | 真实原因 |
+|---|---|---|---|
+| 美国 puredns | 105 | zero_alive | Sub-Store 里该订阅的 URL **指向自己的实例且内含换行**，请求即 `InvalidURL`；需要在 Sub-Store 改 URL |
+| saki | 0 | source_failure | 上游 `saki.tomorin.xyz` 返回 **404**，链接失效 |
+| lw家宽 | 0 | source_failure | 上游 `lw.isdo.dpdns.org/uqn/buniq` 返回 **404** |
+| dafeng-s | 50 | zero_alive | 香港视角抽样 6 个也 0 存活（对照组 prologue 5 抽样 4 活）→ 节点确实不可用 |
+| dafeng | 40 | zero_alive | 同上，且原订阅 40 条只有 16 个不同名字（已由 `dedupe_names` 修掉整源打挂） |
+| warp | 16 | zero_alive | 全部带 `dialer-proxy` 指向 `香港`/`日本`，依赖节点不在任何可取订阅里 → 按失败关闭，不降级成直连 |
+| lxc-us-ports | 11 | zero_alive | 指向 NAT LXC 池机，池子本身 SSH/端口长期 NOBANNER |
+| NTT-verify / NTT / hk-cf / CM-CF | 6/1/2/1 | zero_alive | 单点或少量节点，trace 不通 |
+| 收集的节点 / 三网cf | 3/3 | zero_alive | 极小本地源，入口为 CF 前置域名，trace 穿不过去 |
+
+### 最终可用性复核（hk3 上 API 实测）
+
+- 11 个 `gist-*` 订阅全部可下载：2177=12、233pio=2、ai=26、bamboo=22、fe=16、glados=10、ikunkun=1、
+  pokenmen=24、prologue=72、purens=142、健康中心=8
+- 12 个集合中 11 个正常（air=92、ssss=28、CDN=6、xray-opencode=1、中国地区=17、混合subfree=26、
+  测说=28、ss-air=25、非优化=22、去除大妈系列 亚太地区=29、sssssss-alive=76）；
+  `usa` 下载报错，但**迁移前它本来就是空集合**（`subscriptions: []`，已用迁移前备份核对），与本次迁移无关。
+- 剩余旧测活订阅只有 `probe-美国 puredns-local`（集合 `sssss` 仍在引用，等该源恢复后替换）。
+
 ## 旧执行器下线
 
 | 位置 | 状态 | 证据 |
