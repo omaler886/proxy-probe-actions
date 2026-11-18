@@ -60,9 +60,13 @@ jobs:
           fi
           # Sanity: the dump is a headerless "start,end,asn,org" CSV. Reject an
           # HTML error page or a truncated download before it poisons ASN naming.
-          gzip -dc "$RUNNER_TEMP/asndb/asn.csv.gz" | head -n 2
-          test "$(gzip -dc "$RUNNER_TEMP/asndb/asn.csv.gz" | head -n 1 | awk -F, '{print NF}')" -ge 4
-          echo "PROBE_ASN_CSV=$RUNNER_TEMP/asndb/asn.csv.gz" >> "$GITHUB_ENV"
+          # Decompress to a regular file first: `gzip -dc | head` makes gzip die
+          # on SIGPIPE, which fails the step under `set -o pipefail`.
+          gzip -dc "$RUNNER_TEMP/asndb/asn.csv.gz" > "$RUNNER_TEMP/asndb/asn.csv"
+          head -n 2 "$RUNNER_TEMP/asndb/asn.csv"
+          test "$(head -n 1 "$RUNNER_TEMP/asndb/asn.csv" | awk -F, '{print NF}')" -ge 4
+          # Feed the plain CSV to the resolver (also avoids re-gzip on each run).
+          echo "PROBE_ASN_CSV=$RUNNER_TEMP/asndb/asn.csv" >> "$GITHUB_ENV"
       - name: Verify Gist read access before spending measurement time
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
