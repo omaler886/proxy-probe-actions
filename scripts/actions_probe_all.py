@@ -932,7 +932,10 @@ def run(env=None, transport=None, probe=None):
             private_write(output / name, content)
         summary["phase"] = "complete"
         private_write(output / "measurement.json", json_text(dict(summary, results=result_reports(results, files))))
-        return 0 if not summary["failure"] else 1, summary
+        # A partial source failure is recorded in the summary, but a successful
+        # guarded publication is a successful workflow outcome. Exit nonzero only
+        # when the publication path itself failed or no usable root existed.
+        return 0 if summary["publication"] in {"published", "no_change", "local_only"} else 1, summary
     except Exception as exc:
         summary["failure"] = max(1, summary["failure"])
         summary["error_code"] = error_code(exc)
