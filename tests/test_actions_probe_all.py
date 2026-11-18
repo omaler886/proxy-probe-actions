@@ -138,7 +138,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotIn("upstream", first)
         renamed_name = yaml.safe_load(first)["proxies"][0]["name"]
-        self.assertTrue(renamed_name.startswith("🇺🇸-美国-"))
+        self.assertTrue(renamed_name.startswith("🇺🇸美国-"))
         self.assertIn("-Unknown-未知地址", renamed_name)
 
 

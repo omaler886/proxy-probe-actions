@@ -589,8 +589,9 @@ def _display_name(measurement):
     asn = geo["asn"]
     org = ASN_SHORT.get(asn) or _org_short(geo["org"])
     address = geo["district"] or geo["city"] or geo["region"] or "未知地址"
-    asn_part = ("AS%d{%s}" % (asn, org)) if asn else org
-    return "-".join(part for part in (_flag(cc), country, asn_part, address) if part)
+    # Display format: flag+country-organization-short-name-lowest-geo.
+    # Keep ASN numbers out of names; the organization abbreviation is enough.
+    return "-".join(part for part in (_flag(cc) + country, org, address) if part)
 
 
 def _prefetch_geo(measurements):
