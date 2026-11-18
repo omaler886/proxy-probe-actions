@@ -52,7 +52,11 @@ class FakeGist:
             update = json.loads(body)["files"]
             self.patches.append(update)
             for key, entry in update.items():
-                self.files[key] = entry["content"]
+                # Gist semantics: {"content": null} deletes the file.
+                if entry is None or entry.get("content") is None:
+                    self.files.pop(key, None)
+                else:
+                    self.files[key] = entry["content"]
             return b"{}", {}
         if url.startswith("https://" + self.raw_host + "/raw/"):
             name = url.rsplit("/", 1)[1]
@@ -393,6 +397,24 @@ class PublisherTests(unittest.TestCase):
         self.publisher(remote).publish([candidate("new-source", 6)])
         self.assertEqual(remote.files[p.source_file("airport")], self.old[p.source_file("airport")])
         self.assertIn(p.source_file("airport"), json.loads(remote.files["manifest.json"])["sources"])
+
+    def test_self_referential_gist_artifact_is_deleted_not_preserved(self):
+        stale = candidate("gist-glados", 4)
+        files = dict(self.old)
+        files[p.source_file("gist-glados")] = stale.content
+        manifest = json.loads(files["manifest.json"])
+        manifest["sources"][p.source_file("gist-glados")] = {
+            "name": "gist-glados", "input": 4, "alive": 4, "published": 4,
+            "last_success_alive": 4, "preserved": False}
+        files["manifest.json"] = json.dumps(manifest)
+        remote = FakeGist(files)
+        fresh = candidate(count=3)
+        self.publisher(remote).publish([fresh])
+        self.assertNotIn(p.source_file("gist-glados"), remote.files)
+        self.assertNotIn(p.source_file("gist-glados"),
+                         json.loads(remote.files["manifest.json"])["sources"])
+        # The remaining real sources are written normally, not dropped.
+        self.assertEqual(remote.files[p.source_file("airport")], fresh.content)
 
     def test_patch_failure_leaves_previous_unchanged(self):
         remote = FakeGist(self.old)

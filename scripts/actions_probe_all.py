@@ -601,9 +601,17 @@ def plan_updates(results, old):
             raise ValueError
     except (ValueError, TypeError):
         raise ProbeError("manifest_invalid") from None
-    # Deliberately retain remote sources absent from today's authoritative selection.
+    # Deliberately retain remote sources absent from today's authoritative selection,
+    # except artifacts that were produced by measuring our own published files
+    # (a `gist-` source). Those are self-referential and must not survive a fix
+    # to the source filter, otherwise the feedback loop lives on in the manifest.
     effective = {key: value for key, value in old.items() if SOURCE_FILE.fullmatch(key)}
     manifest = {"version": 1, "sources": copy.deepcopy(previous)}
+    for filename in list(manifest["sources"]):
+        stored = manifest["sources"][filename].get("name", "")
+        if isinstance(stored, str) and stored.lower().startswith("gist-"):
+            manifest["sources"].pop(filename, None)
+            effective.pop(filename, None)
     for result in results:
         filename = source_file(result.name)
         last = previous.get(filename, {})
@@ -702,9 +710,14 @@ class GistPublisher:
         # Counts/status alone must never produce standalone manifest revisions.
         yaml_updates = {name: {"content": text} for name, text in files.items()
                         if name != "manifest.json" and digest(text) != digest(old.get(name, ""))}
-        if not yaml_updates:
+        if not yaml_updates and not any(
+                SOURCE_FILE.fullmatch(name) and name not in files for name in old):
             return "no_change", files
         updates = dict(yaml_updates)
+        # A file dropped from the plan (self-referential artifact cleanup) is
+        # deleted on the same PATCH, so the stale subscription cannot be pulled.
+        updates.update({name: None for name in old
+                        if SOURCE_FILE.fullmatch(name) and name not in files})
         if digest(files["manifest.json"]) != digest(old.get("manifest.json", "")):
             updates["manifest.json"] = {"content": files["manifest.json"]}
         # GitHub Gist PATCH rejects If-Match (HTTP 400): no atomic CAS exists
