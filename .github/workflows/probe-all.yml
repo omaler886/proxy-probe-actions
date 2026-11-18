@@ -69,6 +69,7 @@ jobs:
           MIHOMO_BIN: ${{ runner.temp }}/bin/mihomo
           PROBE_OUTPUT_DIR: ${{ runner.temp }}/probe-output
           PROBE_CONCURRENCY: '8'
+          PROBE_GEO_LOOKUP: '1'
           PROBE_SOURCES_JSON: ${{ inputs.sources_json }}
         run: |
           set -euo pipefail

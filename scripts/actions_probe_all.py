@@ -522,6 +522,77 @@ def choose_measurements(source, graph, measurements):
     return [value[1] for _, value in sorted(by_exit.items())]
 
 
+COUNTRY_ZH = {
+    "US": "美国", "CA": "加拿大", "GB": "英国", "DE": "德国", "FR": "法国",
+    "NL": "荷兰", "BE": "比利时", "CH": "瑞士", "AT": "奥地利", "IT": "意大利",
+    "ES": "西班牙", "PT": "葡萄牙", "SE": "瑞典", "NO": "挪威", "DK": "丹麦",
+    "FI": "芬兰", "IE": "爱尔兰", "PL": "波兰", "CZ": "捷克", "RO": "罗马尼亚",
+    "RU": "俄罗斯", "UA": "乌克兰", "TR": "土耳其", "IL": "以色列", "AE": "阿联酋",
+    "IN": "印度", "JP": "日本", "KR": "韩国", "SG": "新加坡", "HK": "香港",
+    "TW": "台湾", "MO": "澳门", "MY": "马来西亚", "TH": "泰国", "VN": "越南",
+    "ID": "印度尼西亚", "PH": "菲律宾", "AU": "澳大利亚", "NZ": "新西兰",
+    "BR": "巴西", "AR": "阿根廷", "MX": "墨西哥", "ZA": "南非", "CN": "中国",
+}
+ASN_SHORT = {
+    13335: "Cloudflare", 16509: "AWS", 15169: "Google", 8075: "Microsoft",
+    6939: "HE", 24940: "Hetzner", 14061: "DigitalOcean", 16276: "OVH",
+    12876: "Scaleway", 9009: "M247", 51167: "Contabo", 197540: "Netcup",
+    20473: "Vultr", 63949: "Linode", 45102: "Alibaba", 132203: "Tencent",
+    4134: "Chinanet", 4837: "Unicom", 9808: "ChinaMobile", 9929: "Unicom",
+}
+GEO_CACHE = {}
+
+
+def _flag(cc):
+    cc = (cc or "").upper()
+    if len(cc) != 2 or not cc.isalpha():
+        return ""
+    return chr(0x1F1E6 + ord(cc[0]) - 65) + chr(0x1F1E6 + ord(cc[1]) - 65)
+
+
+def _org_short(value):
+    value = re.sub(r"\b(inc|llc|ltd|limited|corp|corporation|co|company|gmbh|sarl|plc)\b", "", str(value or ""), flags=re.I)
+    value = re.sub(r"[^A-Za-z0-9& -]", "", value).strip(" -")
+    words = [word for word in value.split() if word]
+    return (words[0] if words else "Unknown")[:20]
+
+
+def _geo_for_ip(ip, fallback_cc):
+    if ip in GEO_CACHE:
+        return GEO_CACHE[ip]
+    result = {"cc": (fallback_cc or "").upper(), "country": "", "city": "", "region": "", "district": "", "asn": 0, "org": ""}
+    if os.environ.get("PROBE_GEO_LOOKUP", "0") == "1":
+        try:
+            request = urllib.request.Request("https://ipwho.is/" + urllib.parse.quote(ip, safe=""), headers={"User-Agent": UA})
+            with urllib.request.urlopen(request, timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8", "replace"))
+            if data.get("success") is not False:
+                result.update({
+                    "cc": str(data.get("country_code") or result["cc"]).upper(),
+                    "country": str(data.get("country") or ""),
+                    "city": str(data.get("city") or ""),
+                    "region": str(data.get("region") or ""),
+                    "district": str(data.get("district") or ""),
+                    "asn": int((data.get("connection") or {}).get("asn") or 0),
+                    "org": str((data.get("connection") or {}).get("org") or ""),
+                })
+        except (OSError, ValueError, TypeError, urllib.error.URLError):
+            pass
+    GEO_CACHE[ip] = result
+    return result
+
+
+def _display_name(measurement):
+    geo = _geo_for_ip(measurement.ip, measurement.cc)
+    cc = geo["cc"] or measurement.cc.upper()
+    country = COUNTRY_ZH.get(cc) or geo["country"] or cc or "未知"
+    asn = geo["asn"]
+    org = ASN_SHORT.get(asn) or _org_short(geo["org"])
+    address = geo["district"] or geo["city"] or geo["region"] or "未知地址"
+    asn_part = ("AS%d{%s}" % (asn, org)) if asn else org
+    return "-".join(part for part in (_flag(cc), country, asn_part, address) if part)
+
+
 def source_output(source, graph, measurements):
     selected = choose_measurements(source, graph, measurements)
     roots = [item.name for item in selected]
@@ -532,8 +603,7 @@ def source_output(source, graph, measurements):
     names = {name: "__front-" + namespace + "-" + graph.identity(name)[:20] for name in nodes}
     names.update({name: "G-" + namespace + "-" + graph.identity(name)[:20] for name in groups})
     for item in selected:
-        proto = re.sub(r"[^A-Za-z0-9]", "", str(graph.nodes[item.name].get("type", "proxy"))).upper() or "PROXY"
-        names[item.name] = "-".join((label, item.cc, proto, digest(item.ip)[:12], graph.identity(item.name)[:20]))
+        names[item.name] = _display_name(item)
     # Duplicate connections within a source remain present for non-GlaDOS sources;
     # stable suffixes avoid invalid duplicate names without including upstream names.
     used = {}
@@ -581,11 +651,22 @@ def merge_sources(contents):
     for fp in sorted(choices):
         _, graph, root = choices[fp]
         doc = graph.export([root])
+        rename = {}
         for key, target in (("proxies", merged_nodes), ("proxy-groups", merged_groups)):
             for item in doc.get(key, []):
                 old = target.get(item["name"])
                 if old is not None and old != item:
-                    raise ProbeError("namespace_collision")
+                    rename[item["name"]] = item["name"] + "-" + fp[:8]
+        if rename:
+            for key in ("proxies", "proxy-groups"):
+                for item in doc.get(key, []):
+                    item["name"] = rename.get(item["name"], item["name"])
+                    if "dialer-proxy" in item:
+                        item["dialer-proxy"] = rename.get(item["dialer-proxy"], item["dialer-proxy"])
+                    if "proxies" in item:
+                        item["proxies"] = [rename.get(value, value) for value in item["proxies"]]
+        for key, target in (("proxies", merged_nodes), ("proxy-groups", merged_groups)):
+            for item in doc.get(key, []):
                 target[item["name"]] = item
     result = {"proxies": [merged_nodes[name] for name in sorted(merged_nodes)]}
     if merged_groups:

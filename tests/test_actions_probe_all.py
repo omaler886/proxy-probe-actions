@@ -137,7 +137,9 @@ class SelectionTests(unittest.TestCase):
         second, _ = p.source_output("airport", renamed, [p.Measurement("new upstream name", "8.8.8.8", "US")])
         self.assertEqual(first, second)
         self.assertNotIn("upstream", first)
-        self.assertRegex(yaml.safe_load(first)["proxies"][0]["name"], r"^airport-[a-f0-9]+-US-SS-[a-f0-9]+-[a-f0-9]+$")
+        renamed_name = yaml.safe_load(first)["proxies"][0]["name"]
+        self.assertTrue(renamed_name.startswith("🇺🇸-美国-"))
+        self.assertIn("-Unknown-未知地址", renamed_name)
 
 
 class DependencyTests(unittest.TestCase):
