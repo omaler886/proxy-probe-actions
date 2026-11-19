@@ -134,6 +134,7 @@ jobs:
           # stays the only writer of the Gist.
           PROBE_V6_HELPER: ${{ secrets.V6_HELPER_HOST }}
           PROBE_V6_SSH_PORT: ${{ secrets.V6_HELPER_PORT }}
+          PROBE_V6_SSH_USER: ${{ secrets.V6_HELPER_USER }}
           PROBE_V6_MIHOMO: /opt/probe-v6/bin/mihomo
           PROBE_V6_WORKERS: '4'
         run: |

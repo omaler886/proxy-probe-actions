@@ -1187,6 +1187,19 @@ def result_reports(results, files=None):
     return reports
 
 
+def _ssh_target(env):
+    """``user@host`` for the helper, defaulting the user to root.
+
+    A runner's own account is not root, so the helper's user must be explicit
+    or the key is offered to the wrong account and the auth fails.
+    """
+    host = str(env["PROBE_V6_HELPER"]).strip()
+    if "@" in host:
+        return host
+    user = str(env.get("PROBE_V6_SSH_USER", "root")).strip() or "root"
+    return user + "@" + host
+
+
 def measure_v6_out_of_band(results, configs, env):
     """Settle IPv6-bound nodes on a host that really has IPv6.
 
@@ -1231,7 +1244,7 @@ def measure_v6_out_of_band(results, configs, env):
     else:
         command += ["-o", "StrictHostKeyChecking=accept-new"]
     command += ["-p", str(env["PROBE_V6_SSH_PORT"]),
-               str(env["PROBE_V6_HELPER"]),
+               _ssh_target(env),
                "python3 /opt/probe-v6/scripts/v6_worker.py"]
     try:
         run = subprocess.run(command, input=json_text(payload).encode(),
