@@ -54,6 +54,12 @@ location-restricted node may fail from GitHub even when reachable elsewhere.
 
 Gist `public: false` means **unlisted**, not access-controlled/private: holders of the raw URL can read the credentials in a subscription. The source code repository itself is public, so the Gist id must never be rendered into step summaries, logs, or committed files. Do not distribute raw URLs publicly.
 
+## Adding a subscription source
+
+Sources are discovered live from Sub-Store (`GET /api/subs`): a new Sub-Store sub is picked up by the next round with **no code or workflow change** — avoid the reserved `probe-`/`chain-`/`rust-` name prefixes (and `测活-DMIT`, `官方可用`).
+
+A source that needs its own credential (auth header, token query parameter, or a URL hosted outside this Sub-Store) uses the reserved `SOURCE_SECRETS_JSON` Actions Secret: one JSON map keyed by exact source name, applied per source at fetch time. Adding the Nth source means updating that Secret's value only — never this repo. Full guide (bilingual): [docs/ADDING_SOURCES.md](docs/ADDING_SOURCES.md).
+
 ## Outputs
 
 - `mihomo-alive.yaml`: fixed merged subscription (no per-run names).

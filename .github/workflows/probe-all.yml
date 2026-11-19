@@ -127,6 +127,10 @@ jobs:
           # Gist id 也是定位器：secret gist 只要拿到 URL 就能匿名读全文，
           # 所以它和 token 一样只从 secret 注入，绝不写在仓库里。
           GIST_ID: ${{ secrets.GIST_ID }}
+          # 新增需要独立凭据的订阅源时的预留位（详见 docs/ADDING_SOURCES.md）：
+          # 一个 secret 装下所有「源名 -> 凭据」的 JSON map，以后加源只改这个
+          # secret 的值，workflow 和代码都不用动。未设置时为空串=无行为变化。
+          SOURCE_SECRETS_JSON: ${{ secrets.SOURCE_SECRETS_JSON }}
           MIHOMO_BIN: ${{ runner.temp }}/bin/mihomo
           PROBE_OUTPUT_DIR: ${{ runner.temp }}/probe-output
           # Tracing is I/O bound (one curl per node against one shared kernel),

@@ -956,5 +956,121 @@ class V6WorkerMergeTests(unittest.TestCase):
                 self.assertEqual(merged[0].unverifiable, 3)
 
 
+class SourceSecretsTests(unittest.TestCase):
+    """The reserved per-source credential extension point (docs/ADDING_SOURCES.md)."""
+
+    def test_absent_or_empty_env_means_no_credentials(self):
+        self.assertEqual(p.load_source_secrets({}), {})
+        self.assertEqual(p.load_source_secrets({"SOURCE_SECRETS_JSON": "   "}), {})
+        self.assertEqual(p.load_source_secrets({"SOURCE_SECRETS_JSON": '{"a": {"header": {"X": "1"}}}'}),
+                         {"a": {"header": {"X": "1"}}})
+
+    def test_invalid_shapes_fail_with_fixed_code_and_no_value_leak(self):
+        cases = [
+            "not json",
+            "[]",
+            '[{"a": 1}]',
+            '{"a": "string"}',
+            '{"": {"header": {"X": "1"}}}',
+            '{"a": {}}',
+            '{"a": {"unknown": 1}}',
+            '{"a": {"header": {"X": 1}}}',
+            '{"a": {"query": {"t": 1}}}',
+            '{"a": {"url": "ftp://other.example/sub"}}',
+            '{"a": {"url": "https://user:pass@other.example/sub"}}',
+            '{"a": {"url": "not a url"}}',
+        ]
+        for raw in cases:
+            with self.subTest(raw=raw):
+                with self.assertRaises(p.ProbeError) as got:
+                    p.load_source_secrets({"SOURCE_SECRETS_JSON": raw})
+                self.assertEqual(p.error_code(got.exception), "source_secrets_invalid")
+                self.assertNotIn("abc123", p.error_code(got.exception))
+
+    def test_header_applies_only_to_matching_source(self):
+        seen = {}
+
+        def transport(method, url, headers=None, body=None):
+            seen[url] = dict(headers or {})
+            return p.canonical({"proxies": [node()]}).encode(), {}
+
+        store = p.SubStore("https://fixture.invalid/SECRET", transport,
+                           source_secrets={"机场A": {"header": {"Authorization": "Bearer abc123"}}})
+        store.config("机场A")
+        store.config("其他源")
+        # Assert the auth header landed on the 机场A fetch and nowhere else.
+        self.assertEqual(len(seen), 2)
+        hits = [h for h in seen.values() if "Authorization" in h]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["Authorization"], "Bearer abc123")
+        self.assertTrue(all("SECRET" not in json.dumps(h) for h in seen.values()))
+
+    def test_query_merges_over_target_parameter(self):
+        seen = {}
+
+        def transport(method, url, headers=None, body=None):
+            seen[url] = True
+            return p.canonical({"proxies": [node()]}).encode(), {}
+
+        store = p.SubStore("https://fixture.invalid/SECRET", transport,
+                           source_secrets={"token源": {"query": {"token": "abc123"}}})
+        store.config("token源")
+        url = next(iter(seen))
+        self.assertIn("target=ClashMeta", url)
+        self.assertIn("token=abc123", url)
+
+    def test_url_override_bypasses_base_for_that_source_only(self):
+        seen = {}
+
+        def transport(method, url, headers=None, body=None):
+            seen[url] = True
+            return p.canonical({"proxies": [node()]}).encode(), {}
+
+        store = p.SubStore("https://fixture.invalid/SECRET", transport,
+                           source_secrets={"外部源": {"url": "https://other.example/sub?target=ClashMeta"}})
+        store.config("外部源")
+        store.config("普通源")
+        self.assertTrue(any(url.startswith("https://other.example/") for url in seen))
+        self.assertTrue(any(url.startswith("https://fixture.invalid/") for url in seen))
+
+    def test_unicode_names_are_keyed_exactly(self):
+        seen = {}
+
+        def transport(method, url, headers=None, body=None):
+            seen[url] = dict(headers or {})
+            return p.canonical({"proxies": [node()]}).encode(), {}
+
+        store = p.SubStore("https://fixture.invalid/SECRET", transport,
+                           source_secrets={"健康中心": {"header": {"X-Key": "abc123"}}})
+        store.config("健康中心")
+        store.config("健康中心 ")
+        self.assertEqual(len([h for h in seen.values() if "X-Key" in h]), 1)
+
+    def test_run_wires_source_secrets_from_env(self):
+        # End-to-end: run() passes the parsed map into SubStore, so a header
+        # secret set via env lands on that source's download request.
+        seen = {}
+        names = ["机场A"]
+
+        def transport(method, url, headers=None, body=None):
+            seen[url] = dict(headers or {})
+            if url.endswith("/api/subs"):
+                return json.dumps({"data": [{"name": name} for name in names]}).encode(), {}
+            return p.canonical({"proxies": [node()]}).encode(), {}
+
+        def probe(graph, roots):
+            return [p.Measurement(name, "8.8.8.8", "US") for name in roots], 0, 0
+
+        with tempfile.TemporaryDirectory() as temp:
+            env = {"SUBSTORE_BASE": "https://fixture.invalid/SECRET", "PROBE_OUTPUT_DIR": temp,
+                   "SOURCE_SECRETS_JSON": json.dumps({"机场A": {"header": {"Authorization": "Bearer abc123"}}})}
+            code, summary = p.run(env, transport, probe)
+            self.assertEqual(code, 0)
+            download_headers = [h for url, h in seen.items() if "/download/" in url]
+            self.assertEqual(len(download_headers), 1)
+            self.assertEqual(download_headers[0].get("Authorization"), "Bearer abc123")
+            self.assertNotIn("abc123", json.dumps(summary))
+
+
 if __name__ == "__main__":
     unittest.main()

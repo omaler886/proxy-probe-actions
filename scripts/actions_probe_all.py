@@ -6,6 +6,10 @@ Run: SUBSTORE_BASE=... MIHOMO_BIN=/path/mihomo PROBE_OUTPUT_DIR=/private/path
 Optional: GIST_TOKEN + GIST_ID (or GITHUB_GIST_ID), PROBE_CONCURRENCY=8,
 PROBE_TIMEOUT=15, PROBE_FRONT_SUB=cf-front, PROBE_SOURCES_JSON='["source"]'.
 When PROBE_SOURCES_JSON is unset, every selected source is tested every round.
+Per-source credentials: SOURCE_SECRETS_JSON (an Actions Secret holding a JSON
+map keyed by source name — see docs/ADDING_SOURCES.md). Absent or empty means
+no source needs its own credential; adding a source NEVER requires touching
+this file or the workflow again.
 Explicitly selected source names/counts are reported; upstream names/URLs never are.
 Output contains credentials: NEVER
 upload this directory as an Actions artifact. Serialize workflow runs externally.
@@ -57,7 +61,7 @@ class ProbeError(Exception):
     """Deliberately contains only a non-sensitive category."""
 
 
-ERROR_CODES = set("trace_invalid github_redirect response_large upstream_redirect transport_failure redirect_limit base_invalid sources_invalid subscription_invalid definition_invalid definition_duplicate definition_collision dependency_invalid dependency_cycle_or_direct dependency_missing kernel_validation_failure kernel_config_failure kernel_start_failure kernel_end_failure kernel_execution_failure old_content_invalid namespace_collision manifest_invalid gist_id_invalid gist_token_invalid gist_not_private gist_raw_invalid environment_missing kernel_missing curl_missing sources_empty sources_filter_invalid sources_filter_missing no_successful_roots gist_conflict http_failure request_invalid non_proxy_outbound dependency_group_unsupported".split())
+ERROR_CODES = set("trace_invalid github_redirect response_large upstream_redirect transport_failure redirect_limit base_invalid sources_invalid source_secrets_invalid subscription_invalid definition_invalid definition_duplicate definition_collision dependency_invalid dependency_cycle_or_direct dependency_missing kernel_validation_failure kernel_config_failure kernel_start_failure kernel_end_failure kernel_execution_failure old_content_invalid namespace_collision manifest_invalid gist_id_invalid gist_token_invalid gist_not_private gist_raw_invalid environment_missing kernel_missing curl_missing sources_empty sources_filter_invalid sources_filter_missing no_successful_roots gist_conflict http_failure request_invalid non_proxy_outbound dependency_group_unsupported".split())
 
 
 def error_code(exc):
@@ -301,12 +305,70 @@ class Transport:
         raise ProbeError("redirect_limit")
 
 
+def load_source_secrets(env):
+    """Parse SOURCE_SECRETS_JSON into a per-source credential map (see docs/ADDING_SOURCES.md).
+
+    Reserved extension point for adding a subscription source that needs its own
+    credential: the Actions Secret holds one JSON object keyed by source name:
+
+        {"<source name>": {"header": {"Authorization": "..."},
+                           "query": {"token": "..."},
+                           "url": "https://host/override?target=ClashMeta"}}
+
+    All three keys are optional; unknown keys and shapes fail with a fixed
+    error_code so no credential fragment can reach stdout/logs. Absent or empty
+    env means no source needs its own credential. Values are never logged.
+    """
+    raw = str(env.get("SOURCE_SECRETS_JSON", "") or "").strip()
+    if not raw:
+        return {}
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        raise ProbeError("source_secrets_invalid") from None
+    if not isinstance(doc, dict):
+        raise ProbeError("source_secrets_invalid")
+    parsed = {}
+    for name, spec in doc.items():
+        if not isinstance(name, str) or not name or not isinstance(spec, dict):
+            raise ProbeError("source_secrets_invalid")
+        unknown = set(spec) - {"header", "query", "url"}
+        if unknown:
+            raise ProbeError("source_secrets_invalid")
+        entry = {}
+        headers = spec.get("header")
+        if headers is not None:
+            if not isinstance(headers, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in headers.items()):
+                raise ProbeError("source_secrets_invalid")
+            entry["header"] = dict(headers)
+        query = spec.get("query")
+        if query is not None:
+            if not isinstance(query, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in query.items()):
+                raise ProbeError("source_secrets_invalid")
+            entry["query"] = dict(query)
+        url = spec.get("url")
+        if url is not None:
+            if not isinstance(url, str):
+                raise ProbeError("source_secrets_invalid")
+            parts = urllib.parse.urlsplit(url)
+            if parts.scheme not in ("http", "https") or not parts.hostname or parts.username:
+                raise ProbeError("source_secrets_invalid")
+            entry["url"] = url
+        if not entry:
+            raise ProbeError("source_secrets_invalid")
+        parsed[name] = entry
+    return parsed
+
+
 class SubStore:
-    def __init__(self, base, transport):
+    def __init__(self, base, transport, source_secrets=None):
         parsed = urllib.parse.urlsplit(base)
         if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.query or parsed.fragment:
             raise ProbeError("base_invalid")
         self.base, self.transport = base.rstrip("/"), transport
+        # Per-source credentials are keyed by exact source name; a name without
+        # an entry simply uses the plain Sub-Store URL like today.
+        self.source_secrets = source_secrets or {}
 
     def sources(self):
         raw, _ = self.transport("GET", self.base + "/api/subs")
@@ -320,7 +382,18 @@ class SubStore:
         return sorted(names)
 
     def config(self, name):
-        raw, _ = self.transport("GET", self.base + "/download/" + urllib.parse.quote(name, safe="") + "?target=ClashMeta")
+        secret = self.source_secrets.get(name, {})
+        url = self.base + "/download/" + urllib.parse.quote(name, safe="") + "?target=ClashMeta"
+        if "url" in secret:
+            # Full-URL override for a source hosted outside this Sub-Store. The
+            # transport still applies its own redirect/size discipline.
+            url = secret["url"]
+        if "query" in secret:
+            parts = urllib.parse.urlsplit(url)
+            merged = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+            merged.update(secret["query"])
+            url = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(merged)))
+        raw, _ = self.transport("GET", url, headers=secret.get("header"))
         value = yaml.safe_load(raw)
         if not isinstance(value, dict) or not isinstance(value.get("proxies"), list):
             raise ProbeError("subscription_invalid")
@@ -1329,7 +1402,7 @@ def run(env=None, transport=None, probe=None):
         if not base or not env.get("PROBE_OUTPUT_DIR", "").strip():
             raise ProbeError("environment_missing")
         transport = transport or Transport()
-        store = SubStore(base, transport)
+        store = SubStore(base, transport, source_secrets=load_source_secrets(env))
         output = private_dir(env["PROBE_OUTPUT_DIR"])
         if probe is None:
             binary = env.get("MIHOMO_BIN", "").strip()
