@@ -15,7 +15,7 @@ GitHub Actions runner (ubuntu-24.04, mihomo v1.19.29 固定校验)
    ├─ 每节点固定 loopback HTTP listener → curl 显式代理 → cloudflare.com/cdn-cgi/trace
    ├─ 只认 trace 返回的 ip + loc（公网地址 + 合法国家码），无直连降级、无出口缓存
    └─ 重命名：<源标签>-<国家>-<协议>-<出口hash>-<连接指纹>
-Gist 599bdba3…（public:false）
+Gist `<GIST_ID>`（public:false）
    ├─ mihomo-alive.yaml（合并）
    ├─ source-<sha256(源名)>.yaml（每源一份固定文件）
    ├─ manifest.json（源名/计数/digest/保旧标记）
@@ -72,7 +72,7 @@ Gist 599bdba3…（public:false）
 | 源 | 输入 | 判定 | 真实原因 |
 |---|---|---|---|
 | 美国 puredns | 105 | zero_alive | Sub-Store 里该订阅的 URL **指向自己的实例且内含换行**，请求即 `InvalidURL`；需要在 Sub-Store 改 URL |
-| saki | 0 | source_failure | 上游 `saki.tomorin.xyz` 返回 **404**，链接失效 |
+| saki | 0 | source_failure | 上游 `<UPSTREAM_HOST>` 返回 **404**，链接失效 |
 | lw家宽 | 0 | source_failure | 上游 `lw.isdo.dpdns.org/uqn/buniq` 返回 **404** |
 | dafeng-s | 50 | zero_alive | 香港视角抽样 6 个也 0 存活（对照组 prologue 5 抽样 4 活）→ 节点确实不可用 |
 | dafeng | 40 | zero_alive | 同上，且原订阅 40 条只有 16 个不同名字（已由 `dedupe_names` 修掉整源打挂） |
@@ -108,7 +108,7 @@ LXC 那两台恢复 SSH 后仍需单独停用，否则可能继续写回 Sub-Sto
 测活产物不再存进 Sub-Store，改成「Sub-Store 只持有稳定 URL」：
 
 - 新建 11 个远程订阅 `gist-<源>`，URL 用 **不带 revision** 的 Gist raw 形式
-  `https://gist.githubusercontent.com/omaler886/599bdba3…/raw/source-<sha256>.yaml`（实测 200，
+  `https://gist.githubusercontent.com/<OWNER>/<GIST_ID>/raw/source-<sha256>.yaml`（实测 200，
   永远指向最新 revision，不会因为发布产生新地址）。
 - 5 个用户集合（`air` / `测说` / `ss-air` / `非优化` / `sssssss-alive`）的成员从
   `probe-<源>-local` 换成 `gist-<源>`，改完逐个下载校验：91 / 28 / 27 / 22 / 76 条，均可正常下载。
@@ -122,7 +122,7 @@ LXC 那两台恢复 SSH 后仍需单独停用，否则可能继续写回 Sub-Sto
 
 ## 已知上游问题
 
-`saki` 的订阅 URL（`saki.tomorin.xyz`）在 hk3 上直接请求返回 **HTTP 404**，Sub-Store 因此
+`saki` 的订阅 URL（`<UPSTREAM_HOST>`）在 hk3 上直接请求返回 **HTTP 404**，Sub-Store 因此
 `/download/saki*` 报 500、0 节点。这是机场侧链接失效，不是测活结论。
 
 ## 安全边界

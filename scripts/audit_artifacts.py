@@ -28,6 +28,7 @@ import argparse
 import collections
 import http.client
 import json
+import os
 import re
 import sys
 import time
@@ -42,7 +43,9 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 RAW_HOST = "gist.githubusercontent.com"
 SOURCE_FILE = re.compile(r"source-[0-9a-f]{64}\.yaml\Z")
-DEFAULT_GIST = "<GIST_ID>"
+# Gist id 是定位器，不是凭据，但 secret gist 只要拿到 URL 就能匿名读全文。
+# 公开仓库里不落值：优先 --gist-id，其次环境变量 GIST_ID，最后才用空串报错。
+DEFAULT_GIST = os.environ.get("GIST_ID", "").strip()
 DEFAULT_OWNER = "omaler886"
 
 COUNTER = re.compile(r"-(\d{1,2})\Z")
@@ -278,7 +281,7 @@ def audit(artifacts):
     return report
 
 
-def render(report):
+def render(report, summary_only=False):
     lines = []
     add = lines.append
     add("Gist %s" % report["gist"])
@@ -316,6 +319,10 @@ def render(report):
     add("  %-42s %d" % ("ordinal suffix in merged (was 261)", report["totals"].get("counter_suffix_merged", 0)))
     add("  %-42s %d" % ("generic brand in merged (was 23)", report["totals"].get("generic_brand_merged", 0)))
     add("  %-42s %d" % ("8-hex suffix in merged (was 124)", report["totals"].get("hash_suffix_merged", 0)))
+    # 节点名会带出源名/地区/协议/出口哈希。公开仓库的 job summary 人人可读，
+    # 所以往 step summary 输出时只给汇总数字，明细只写本地文件。
+    if summary_only:
+        return "\n".join(lines)
     for section, entries in report["findings"].items():
         if not entries:
             continue
@@ -357,6 +364,8 @@ def main(argv=None):
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--report", dest="report_path",
                         help="write the human report to this UTF-8 file")
+    parser.add_argument("--summary-only", action="store_true",
+                        help="print/report only the aggregate table, no per-node findings")
     args = parser.parse_args(argv)
 
     artifacts = Artifacts(args.gist_id, args.owner, args.directory).load()
@@ -366,9 +375,9 @@ def main(argv=None):
             json.dump(report, stream, ensure_ascii=False, indent=2, sort_keys=True)
     if args.report_path:
         with open(args.report_path, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(render(report) + "\n")
+            stream.write(render(report, summary_only=args.summary_only) + "\n")
     if not args.quiet:
-        emit(render(report))
+        emit(render(report, summary_only=args.summary_only))
     return 0 if artifacts.sources else 2
 
 

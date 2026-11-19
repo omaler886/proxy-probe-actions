@@ -84,11 +84,13 @@ jobs:
       - name: Verify Gist read access before spending measurement time
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
         run: |
           python - <<'PY'
           import os, json, urllib.request, urllib.error
           token = os.environ['GIST_TOKEN'].strip()
-          request = urllib.request.Request('https://api.github.com/gists/<GIST_ID>', headers={'Authorization': 'Bearer ' + token, 'User-Agent': 'probe-preflight', 'Accept': 'application/vnd.github+json'})
+          gist_id = os.environ['GIST_ID'].strip()
+          request = urllib.request.Request('https://api.github.com/gists/' + gist_id, headers={'Authorization': 'Bearer ' + token, 'User-Agent': 'probe-preflight', 'Accept': 'application/vnd.github+json'})
           try:
               with urllib.request.urlopen(request, timeout=30) as response:
                   data = json.load(response)
@@ -122,7 +124,9 @@ jobs:
         env:
           SUBSTORE_BASE: ${{ secrets.SUBSTORE_BASE }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GIST_ID: '<GIST_ID>'
+          # Gist id 也是定位器：secret gist 只要拿到 URL 就能匿名读全文，
+          # 所以它和 token 一样只从 secret 注入，绝不写在仓库里。
+          GIST_ID: ${{ secrets.GIST_ID }}
           MIHOMO_BIN: ${{ runner.temp }}/bin/mihomo
           PROBE_OUTPUT_DIR: ${{ runner.temp }}/probe-output
           PROBE_CONCURRENCY: '8'
@@ -146,13 +150,15 @@ jobs:
       - name: Audit published artifacts for naming and dedup defects
         env:
           PROBE_OUTPUT_DIR: ${{ runner.temp }}/probe-output
+          GIST_ID: ${{ secrets.GIST_ID }}
         run: |
           set -euo pipefail
           # The runner already holds this round's published files. Auditing the
-          # local copy avoids extra GitHub API calls and rate limits. The report
-          # is printed as a job summary; no subscription bodies are uploaded.
+          # local copy avoids extra GitHub API calls and rate limits.
+          # --summary-only: 只输出汇总数字，不含节点名/源名明细——
+          # 公开仓库的 step summary 人人可读，节点名会带出源与出口信息。
           python scripts/audit_artifacts.py --dir "$PROBE_OUTPUT_DIR" \
-            --report "$RUNNER_TEMP/artifact-audit.txt"
+            --summary-only --report "$RUNNER_TEMP/artifact-audit.txt"
           {
             echo '## Artifact audit'
             echo '```'
