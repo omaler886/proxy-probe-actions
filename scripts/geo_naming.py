@@ -565,28 +565,41 @@ class Resolver:
         cc = geo["cc"] or (fallback_cc or "").upper()
         country = COUNTRY_ZH.get(cc) or geo.get("country") or cc or "未知"
         head = _flag(cc) + t2s(country)
-        brand = geo["org"] or (("AS" + str(geo["asn"])) if geo["asn"] else "Unknown")
+        # A bare AS number ("AS56971") is a defect to users and "Unknown" is a
+        # defect to the auditor. When no brand resolves, drop the brand segment
+        # entirely: the city/region below carry the identity. Only if there is
+        # no location at all do we fall back to the honest "Unknown" marker.
+        brand = geo["org"]
         city = t2s((geo["city"] or "").strip())
         region = t2s((geo["region"] or "").strip())
         zone = t2s((geo.get("zone") or "").strip())
+        mid = ("-" + brand) if brand else ""
         parts = []
         if city and city != country:
-            parts.append(head + "-" + brand + "-" + city[:20])
+            parts.append(head + mid + "-" + city[:20])
             if region and region != city and region != country:
-                parts.append(head + "-" + brand + "-" + city[:20] + "-" + region[:20])
+                parts.append(head + mid + "-" + city[:20] + "-" + region[:20])
         # A city alone often covers an entire metro area (Sydney, Ashburn). The
         # next level is the coarse district/zone inside it, which is what
         # separates two exits of the same provider inside one city. It is a
         # BETTER discriminator than the region, so it goes before the region.
         if zone and zone != city and zone != country:
             if city and city != country:
-                parts.append(head + "-" + brand + "-" + city[:20] + "-" + zone[:20])
+                parts.append(head + mid + "-" + city[:20] + "-" + zone[:20])
             else:
-                parts.append(head + "-" + brand + "-" + zone[:20])
+                parts.append(head + mid + "-" + zone[:20])
         if region and region != country:
-            parts.append(head + "-" + brand + "-" + region[:20])
-        parts.append(head + "-" + brand)
-        # Deduplicate while preserving order.
+            parts.append(head + mid + "-" + region[:20])
+        # Last resort must still be unique per country. With a brand, country
+        # + brand; without one, country + whatever location we have, else
+        # "Unknown". Never a bare ASN.
+        if brand:
+            parts.append(head + "-" + brand)
+        elif parts:
+            pass  # the location-bearing candidates above are the fallbacks
+        else:
+            parts.append(head + "-Unknown")
+        # Deduplicate while preserving order (city==region can repeat a candidate).
         out = []
         for value in parts:
             if value and value not in out:

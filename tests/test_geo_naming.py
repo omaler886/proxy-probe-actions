@@ -91,9 +91,19 @@ class DisplayTests(unittest.TestCase):
                                             city="新加坡")
         self.assertEqual(g.display_name("1.2.3.4", "SG"), "🇸🇬新加坡-AWS")
 
-    def test_brand_falls_back_to_asn_number_not_unknown(self):
+    def test_no_bare_asn_number_in_name_with_city(self):
+        # AS56971 style fallback was a defect; with a city, drop the brand
+        # segment entirely instead of leaking "AS56971" or "Unknown".
+        g.RESOLVER._cache["1.2.3.4"] = dict(g._blank("HK"), asn=56971, org="", city="九龙")
+        self.assertEqual(g.display_name("1.2.3.4", "HK"), "🇭🇰香港-九龙")
+        for part in g.RESOLVER.display_parts("1.2.3.4", "HK"):
+            self.assertNotIn("AS56971", part)
+            self.assertNotIn("Unknown", part)
+
+    def test_no_bare_asn_number_without_location_falls_back_unknown(self):
+        # No brand and no city/region: honest "Unknown" marker, never an ASN.
         g.RESOLVER._cache["1.2.3.4"] = dict(g._blank("US"), asn=64500, org="")
-        self.assertEqual(g.display_name("1.2.3.4", "US"), "🇺🇸美国-AS64500")
+        self.assertEqual(g.display_name("1.2.3.4", "US"), "🇺🇸美国-Unknown")
 
     def test_flag_requires_two_letters(self):
         self.assertEqual(g._flag("US"), "🇺🇸")

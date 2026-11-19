@@ -136,6 +136,17 @@ class AuditTests(unittest.TestCase):
         self.assertFalse(report["health"]["ok"])
         self.assertIn("geolocation", report["health"]["reason"])
 
+    def test_health_ok_with_ordinal_suffixes(self):
+        # "-2"/"-3" are a legitimate egress-sorted collision suffix now; they
+        # must not fail health on their own (duplicate checks cover real dupes).
+        nodes = [node("🇺🇸美国-AWS-Ashburn-2"),
+                 node("🇭🇰香港-HKT-中环-3")]
+        self._source("good", nodes)
+        self.artifacts.merged = {"proxies": nodes}
+        report = a.audit(self.artifacts)
+        self.assertTrue(report["health"]["ok"], report["health"])
+        self.assertGreater(report["totals"]["counter_suffix_merged"], 0)
+
     def test_health_ok_when_all_names_resolved(self):
         nodes = [node("🇺🇸美国-AWS-Ashburn"), node("🇭🇰香港-HKT-中环")]
         self._source("good", nodes)

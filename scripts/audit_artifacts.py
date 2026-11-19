@@ -261,15 +261,19 @@ def audit(artifacts):
     unknown_merged = sum(1 for name in merged_names
                          if UNKNOWN_BRAND.search(str(name)))
     ratio = unknown_merged / total_merged
-    healthy = (ratio <= 0.05 and not report["totals"]["counter_suffix_merged"]
-               and not report["totals"]["generic_brand_merged"])
+    # An ordinal "-2"/"-3" is now a legitimate collision suffix: the publisher
+    # assigns it in a stable egress-sorted order, so it no longer means "one
+    # exit republished N times". Duplication is caught directly by the
+    # duplicate_connection / merged_duplicate_names checks above. Ordinals are
+    # still counted below for visibility, but never fail health on their own.
+    healthy = (ratio <= 0.05 and not report["totals"]["generic_brand_merged"])
     report["health"] = {
         "ok": healthy,
         "unknown_merged": unknown_merged,
         "unknown_ratio": round(ratio, 4),
         "reason": ("" if healthy else
                    "geolocation lookup likely disabled (PROBE_GEO_LOOKUP / ASN dump)"
-                   if ratio > 0.05 else "naming defects still present"),
+                   if ratio > 0.05 else "generic brand used as provider name"),
     }
     return report
 

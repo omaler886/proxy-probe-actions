@@ -72,12 +72,28 @@ class FakeGist:
 
 
 class TraceTests(unittest.TestCase):
+    GOOD = "visit_scheme=https\ntls=TLSv1.3\nfl=x\nip=8.8.8.8\nloc=US\n"
+
     def test_valid_public_trace(self):
-        self.assertEqual(p.parse_trace("fl=x\nip=8.8.8.8\nloc=US\n"), ("8.8.8.8", "US"))
-        self.assertEqual(p.parse_trace("ip=2606:4700:4700::1111\nloc=HK\n")[1], "HK")
+        self.assertEqual(p.parse_trace(self.GOOD), ("8.8.8.8", "US"))
+        self.assertEqual(p.parse_trace("visit_scheme=https\ntls=on\nip=2606:4700:4700::1111\nloc=HK")[1], "HK")
+        self.assertEqual(p.parse_trace("visit_scheme=https\ntls=1.3\nip=8.8.8.8\nloc=US")[1], "US")
+
+    def test_plaintext_or_missing_tls_is_rejected(self):
+        # A 200 with no TLS evidence (captive portal / downgraded hop) must not
+        # count as a measured alive node. Each of these lacks the full TLS 200.
+        for text in (
+            "ip=8.8.8.8\nloc=US\n",                                  # no scheme/tls
+            "visit_scheme=http\ntls=TLSv1.3\nip=8.8.8.8\nloc=US\n",   # plaintext
+            "visit_scheme=https\nip=8.8.8.8\nloc=US\n",              # no tls line
+            "visit_scheme=https\ntls=\nip=8.8.8.8\nloc=US\n",        # empty tls
+            "visit_scheme=https\ntls=off\nip=8.8.8.8\nloc=US\n",     # tls off
+        ):
+            with self.subTest(text=text), self.assertRaises(p.ProbeError):
+                p.parse_trace(text)
 
     def test_invalid_trace(self):
-        for text in ("", "ip=127.0.0.1\nloc=US", "ip=192.168.0.1\nloc=US", "ip=100.64.0.1\nloc=US", "ip=8.8.8.8", "ip=8.8.8.8\nloc=ZZ", "ip=8.8.8.8\nloc=us", "ip=not-ip\nloc=US", "ip=224.0.0.1\nloc=US", "ip=8.8.8.8\nip=1.1.1.1\nloc=US", "ip=::1\nloc=US", "<html>failure</html>"):
+        for text in ("", "ip=127.0.0.1\nloc=US", "ip=192.168.0.1\nloc=US", "ip=100.64.0.1\nloc=US", "visit_scheme=https\ntls=TLSv1.3\nip=8.8.8.8", "visit_scheme=https\ntls=TLSv1.3\nip=8.8.8.8\nloc=ZZ", "visit_scheme=https\ntls=TLSv1.3\nip=8.8.8.8\nloc=us", "visit_scheme=https\ntls=TLSv1.3\nip=not-ip\nloc=US", "visit_scheme=https\ntls=TLSv1.3\nip=224.0.0.1\nloc=US", "visit_scheme=https\ntls=TLSv1.3\nip=8.8.8.8\nip=1.1.1.1\nloc=US", "visit_scheme=https\ntls=TLSv1.3\nip=::1\nloc=US", "<html>failure</html>"):
             with self.subTest(text=text), self.assertRaises(p.ProbeError):
                 p.parse_trace(text)
 
@@ -90,7 +106,7 @@ class TraceTests(unittest.TestCase):
             self.assertIn("--max-time", command)
             self.assertEqual(command[-1], p.TRACE_URL)
             self.assertNotEqual(kwargs["stdout"], subprocess.PIPE)
-            kwargs["stdout"].write(b"ip=8.8.8.8\nloc=US\n")
+            kwargs["stdout"].write(self.GOOD.encode())
             return mock.Mock(returncode=0)
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(p.subprocess, "run", side_effect=fake_run):
             self.assertEqual(p.NativeProbe("mihomo").trace(12345, temp), ("8.8.8.8", "US"))
@@ -173,22 +189,23 @@ class SelectionTests(unittest.TestCase):
         # never a fabricated "未知地址" segment.
         self.assertEqual(renamed_name, "🇺🇸美国-Unknown")
 
-    def test_collision_suffix_is_a_stable_exit_discriminator_not_a_counter(self):
-        """Sibling count must not change a node's suffix (old -2/-3 did)."""
+    def test_collision_suffix_is_a_stable_exit_ordinal_not_name_dependent(self):
+        """Ordinal suffix follows egress-sorted order, not sibling count or name."""
         graph = p.Graph({"proxies": [node("a", "ss", "a.invalid"), node("b", "ss", "b.invalid"),
                                      node("c", "ss", "c.invalid")]})
         both = [p.Measurement("a", "8.8.8.8", "US"), p.Measurement("b", "8.8.4.4", "US")]
         allthree = both + [p.Measurement("c", "9.9.9.9", "US")]
         # All three measure the same cc with no geolocation, so they collide on
-        # "🇺🇸美国-Unknown"; each gets its own stable discriminator.
+        # "🇺🇸美国-Unknown"; the egress-sorted order assigns -2/-3 deterministically.
         text_small, _ = p.source_output("airport", graph, both)
         text_large, _ = p.source_output("airport", graph, allthree)
         small = {n["server"]: n["name"] for n in yaml.safe_load(text_small)["proxies"]}
         large = {n["server"]: n["name"] for n in yaml.safe_load(text_large)["proxies"]}
-        self.assertEqual(small["a.invalid"], large["a.invalid"])
+        # 8.8.4.4 sorts before 8.8.8.8: base name vs -2 ordinal, in both runs.
         self.assertEqual(small["b.invalid"], large["b.invalid"])
-        for name in large.values():
-            self.assertNotRegex(name, r"-\d+$")
+        self.assertEqual(small["a.invalid"], large["a.invalid"])
+        self.assertEqual(small["b.invalid"], "🇺🇸美国-Unknown")
+        self.assertEqual(small["a.invalid"], "🇺🇸美国-Unknown-2")
 
     def test_collision_names_do_not_depend_on_upstream_node_name(self):
         """Renaming an upstream node must not move anybody else's name."""
@@ -207,15 +224,17 @@ class SelectionTests(unittest.TestCase):
                 {n["server"]: n["name"] for n in yaml.safe_load(text)["proxies"]})
         self.assertEqual(by_server["run"][0], by_server["run"][1])
 
-    def test_duplicate_display_names_never_use_sequential_numbers(self):
+    def test_duplicate_display_names_get_stable_ordinals(self):
         graph = p.Graph({"proxies": [node("n%d" % i, "ss", "s%d.invalid" % i) for i in range(5)]})
         measurements = [p.Measurement("n%d" % i, "10.0.0.%d" % (i + 1), "US") for i in range(5)]
         text, published = p.source_output("airport", graph, measurements)
         self.assertEqual(published, 5)
         names = [item["name"] for item in yaml.safe_load(text)["proxies"]]
         self.assertEqual(len(set(names)), 5)
-        for name in names:
-            self.assertNotRegex(name, r"-\d+$")
+        # Egress-sorted ordinals: base name, then -2/-3/-4/-5. export() orders
+        # by connection identity, not by assigned name, so compare as a set.
+        base = "🇺🇸美国-Unknown"
+        self.assertEqual(set(names), {base} | {base + "-%d" % i for i in range(2, 6)})
 
 
 class DependencyTests(unittest.TestCase):

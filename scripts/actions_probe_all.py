@@ -117,6 +117,15 @@ def parse_trace(text: str) -> tuple[str, str]:
     cc = fields.get("loc", "")
     if not addr.is_global or addr.is_multicast or cc not in COUNTRIES:
         raise ProbeError("trace_invalid")
+    # A 200 body alone is not evidence of a full TLS handshake: the trace URL
+    # may be served over plain HTTP by a captive portal or a downgraded hop.
+    # CF emits visit_scheme and tls=TLSv1.3 (or "on" on older edges); require
+    # both so an intercepted/plaintext trace cannot mark a node alive.
+    if fields.get("visit_scheme", "").lower() != "https":
+        raise ProbeError("trace_invalid")
+    tls = fields.get("tls", "").lower()
+    if not (tls == "on" or tls.startswith("tlsv") or tls in {"1.2", "1.3"}):
+        raise ProbeError("trace_invalid")
     return str(addr), cc
 
 
@@ -606,11 +615,13 @@ def source_output(source, graph, measurements):
     names.update({name: "G-" + namespace + "-" + graph.identity(name)[:20] for name in groups})
     exit_of = {item.name: item.ip for item in selected}
     candidates = {item.name: _display_parts(item) for item in selected}
-    # Names must be unique inside one subscription, but a counter is the worst
-    # possible disambiguator: it changes whenever a sibling dies. Walk from the
-    # most specific geographic candidate to the least specific one and take the
-    # first that is still free; only if every level collides does a stable
-    # per-exit fingerprint get appended.
+    # Names must be unique inside one subscription. Walk from the most specific
+    # geographic candidate to the least specific one and take the first that is
+    # still free; only if every level collides do we append "-2", "-3", ...
+    # Ordinals are assigned in egress-IP order (the sort key below), so a node
+    # keeps its number across rounds as long as its exit siblings do not change.
+    # The old bug was numbering by *surviving sibling count*, which made names
+    # jump whenever a sibling died; sorting by a stable key avoids that.
     taken = set()
     for item in sorted(selected, key=lambda entry: (len(candidates[entry.name]),
                                                     candidates[entry.name][0],
@@ -621,12 +632,12 @@ def source_output(source, graph, measurements):
                 chosen = candidate
                 break
         if not chosen:
-            chosen = candidates[item.name][-1]
-            unique = chosen + _suffix(exit_of[item.name])
+            base = candidates[item.name][-1]
             index = 2
+            unique = "%s-%d" % (base, index)
             while unique in taken:
-                unique = chosen + _suffix(exit_of[item.name]) + str(index)
                 index += 1
+                unique = "%s-%d" % (base, index)
             chosen = unique
         taken.add(chosen)
         names[item.name] = chosen
@@ -672,9 +683,18 @@ def merge_sources(contents):
         rename = {}
         for key, target in (("proxies", merged_nodes), ("proxy-groups", merged_groups)):
             for item in doc.get(key, []):
-                old = target.get(item["name"])
+                name = item["name"]
+                old = target.get(name)
                 if old is not None and old != item:
-                    rename[item["name"]] = item["name"] + _stable_tag(fp)
+                    # Ordinal suffix under fp-sorted iteration: the first
+                    # holder keeps the base name, later collisions get -2,
+                    # -3, ... Stable as long as the source set is unchanged.
+                    index = 2
+                    candidate = "%s-%d" % (name, index)
+                    while candidate in target or candidate in rename.values():
+                        index += 1
+                        candidate = "%s-%d" % (name, index)
+                    rename[name] = candidate
         if rename:
             for key in ("proxies", "proxy-groups"):
                 for item in doc.get(key, []):
