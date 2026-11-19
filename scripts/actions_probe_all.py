@@ -387,7 +387,9 @@ class Graph:
 
         The root's own server plus the whole dialer chain: a node whose
         FRONT is an IPv6 literal needs IPv6 just as much as a node whose own
-        address is one.
+        address is one. A malformed dialer reference stops the walk but does
+        not raise: the node is already invalid and the kernel validation
+        reports it, so classification must stay side-effect free.
         """
         servers, stack, seen = [], [root], set()
         while stack:
@@ -395,17 +397,20 @@ class Graph:
             if name in seen:
                 continue
             seen.add(name)
-            if name in self.nodes:
-                item = self.nodes[name]
-                server = item.get("server")
-                if isinstance(server, str) and server:
-                    servers.append(server)
-                ref = self.dependency(item)
-                if ref:
-                    stack.append(ref)
-            elif name in self.groups:
-                for ref in self.groups[name].get("proxies") or []:
-                    stack.append(ref)
+            try:
+                if name in self.nodes:
+                    item = self.nodes[name]
+                    server = item.get("server")
+                    if isinstance(server, str) and server:
+                        servers.append(server)
+                    ref = self.dependency(item)
+                    if ref:
+                        stack.append(ref)
+                elif name in self.groups:
+                    for ref in self.groups[name].get("proxies") or []:
+                        stack.append(ref)
+            except ProbeError:
+                continue
         return servers
 
     def v6_bound(self, root) -> bool:
