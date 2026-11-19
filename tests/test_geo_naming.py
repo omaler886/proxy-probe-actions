@@ -359,6 +359,28 @@ class AsnDbTests(unittest.TestCase):
         self.assertEqual(entry["asn"], 9269)
         self.assertEqual(entry["org"], "HKBN")
 
+    def test_local_db_org_feeds_brand_when_online_apis_fail(self):
+        """AS56971 is NOT in ASN_SHORT; its brand must come from DB-IP's org
+        column, not degrade to a bare 'AS56971' when ip-api/ipwho are blocked."""
+        db = self._db("5.144.179.0,5.144.179.255,56971,\"CGI GLOBAL LIMITED\"\n")
+        original = (g._ASN_DB, g.cymru_asn_cc, g._ipapi_batch, g._ipwho, g.LOOKUP_ON)
+        g._ASN_DB = db
+        g.cymru_asn_cc = lambda ip: (56971, "")
+        g._ipapi_batch = lambda ips: {}     # rate-limited on shared egress
+        g._ipwho = lambda ip: None          # timeout
+        g.LOOKUP_ON = True
+        g.RESOLVER.clear()
+        try:
+            g.prefetch([("5.144.179.1", "")])
+            entry = g.RESOLVER.entry("5.144.179.1")
+            name = g.display_name("5.144.179.1", "")
+        finally:
+            g._ASN_DB, g.cymru_asn_cc, g._ipapi_batch, g._ipwho, g.LOOKUP_ON = original
+            g.RESOLVER.clear()
+        self.assertEqual(entry["org"], "CGI")
+        self.assertNotIn("AS56971", name)
+        self.assertIn("CGI", name)
+
 
 if __name__ == "__main__":
     unittest.main()

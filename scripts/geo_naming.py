@@ -534,8 +534,15 @@ class Resolver:
                 entry["cc"] = _majority([("trace", (fallback or "").upper()),
                                          ("ipapi", pa.get("cc")),
                                          ("ipwho", wh.get("cc"))])
-                entry["org"] = _org_brand(pa.get("asname") or wh.get("org") or "",
-                                          entry["asn"])
+                # Brand resolution must not depend on the online APIs: on a
+                # NAT/shared egress ip-api (403) and ipwho (timeout) routinely
+                # fail, and the old chain then saw no asname/org at all. The
+                # offline DB-IP dump already gave us db_org for that ASN, so
+                # feed it into the brand resolver as the authoritative fallback.
+                # Without this, an ASN we KNOW is "CGI GLOBAL LIMITED" degraded
+                # to the bare "AS56971" that users flagged as a defect.
+                org_raw = (pa.get("asname") or wh.get("org") or db_org or "")
+                entry["org"] = _org_brand(org_raw, entry["asn"])
                 entry["city"] = (pa.get("city")
                                  or CITY_ZH.get(wh.get("city", ""), "")
                                  or wh.get("city", ""))
