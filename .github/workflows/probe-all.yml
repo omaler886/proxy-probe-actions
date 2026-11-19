@@ -152,7 +152,6 @@ jobs:
       - name: Audit published artifacts for naming and dedup defects
         env:
           PROBE_OUTPUT_DIR: ${{ runner.temp }}/probe-output
-          GIST_ID: ${{ secrets.GIST_ID }}
         run: |
           set -euo pipefail
           # The runner already holds this round's published files. Auditing the

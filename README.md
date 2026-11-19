@@ -1,6 +1,6 @@
 # All-source proxy probes on GitHub Actions
 
-Private execution repository. Subscription data and API tokens never belong in Git.
+Public execution repository. This tree is world-readable by design: subscription data and API tokens must never appear here — every credential lives in Actions secrets, and Git history is treated as public.
 
 ## Pipeline
 
@@ -50,9 +50,9 @@ location-restricted node may fail from GitHub even when reachable elsewhere.
 
 - `SUBSTORE_BASE`: complete Sub-Store backend base URL, stored only as an Actions Secret.
 - `GIST_TOKEN`: dedicated token with Gist access, stored only as an Actions Secret.
-- `GIST_ID` is set as a non-sensitive workflow value.
+- `GIST_ID`: the target Gist id, stored only as an Actions Secret. Treat it as sensitive — it is the only thing standing between the subscription and the world.
 
-Gist `public: false` means **unlisted**, not access-controlled/private: holders of the raw URL can read the credentials in a subscription. The source code repository itself is private. Do not distribute raw URLs publicly.
+Gist `public: false` means **unlisted**, not access-controlled/private: holders of the raw URL can read the credentials in a subscription. The source code repository itself is public, so the Gist id must never be rendered into step summaries, logs, or committed files. Do not distribute raw URLs publicly.
 
 ## Outputs
 

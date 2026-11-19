@@ -185,7 +185,6 @@ def connection_key(node):
 
 def audit(artifacts):
     report = {
-        "gist": artifacts.gist_id,
         "sources": len(artifacts.sources),
         "merged_proxies": len(artifacts.merged.get("proxies") or []),
         "errors": list(artifacts.errors),
@@ -284,7 +283,9 @@ def audit(artifacts):
 def render(report, summary_only=False):
     lines = []
     add = lines.append
-    add("Gist %s" % report["gist"])
+    # Gist id is never rendered: this text reaches the public step summary,
+    # and the id is the only thing standing between the subscription and the
+    # world (unlisted Gist == readable by anyone holding the URL).
     add("  sources read      : %d" % report["sources"])
     add("  nodes in sources  : %d" % report["totals"]["source_nodes"])
     add("  merged proxies    : %d" % report["merged_proxies"])

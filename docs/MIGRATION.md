@@ -2,8 +2,8 @@
 
 ## 结论
 
-所有订阅测活已从 hk3 / LXC 上的旧脚本迁到 GitHub Actions（私有仓库
-`omaler886/proxy-probe-actions`），测活结果只写固定 Gist 文件，**不回写 Sub-Store**。
+所有订阅测活已从 hk3 / LXC 上的旧脚本迁到 GitHub Actions（公开仓库
+`omaler886/proxy-probe-actions`，订阅数据只经 Actions secrets 流转），测活结果只写固定 Gist 文件，**不回写 Sub-Store**。
 
 ## 链路
 
@@ -73,7 +73,7 @@ Gist `<GIST_ID>`（public:false）
 |---|---|---|---|
 | 美国 puredns | 105 | zero_alive | Sub-Store 里该订阅的 URL **指向自己的实例且内含换行**，请求即 `InvalidURL`；需要在 Sub-Store 改 URL |
 | saki | 0 | source_failure | 上游 `<UPSTREAM_HOST>` 返回 **404**，链接失效 |
-| lw家宽 | 0 | source_failure | 上游 `lw.isdo.dpdns.org/uqn/buniq` 返回 **404** |
+| lw家宽 | 0 | source_failure | 上游 `<UPSTREAM_HOST>/<UPSTREAM_PATH>` 返回 **404** |
 | dafeng-s | 50 | zero_alive | 香港视角抽样 6 个也 0 存活（对照组 prologue 5 抽样 4 活）→ 节点确实不可用 |
 | dafeng | 40 | zero_alive | 同上，且原订阅 40 条只有 16 个不同名字（已由 `dedupe_names` 修掉整源打挂） |
 | warp | 16 | zero_alive | 全部带 `dialer-proxy` 指向 `香港`/`日本`，依赖节点不在任何可取订阅里 → 按失败关闭，不降级成直连 |

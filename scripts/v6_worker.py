@@ -23,7 +23,9 @@ Result (STDOUT):
 ``judged`` counts nodes this host actually dialled (alive or dead). A node that
 was dialled and failed is PROVEN DEAD; a node this host could not dial either
 stays unverifiable upstream. The payload carries subscription credentials: it
-is never written to disk here and never printed.
+is staged into a private (0600) temporary directory on this host only for the
+duration of each kernel validation or dial, and deleted immediately after; it
+is never written anywhere else and never printed.
 """
 import json
 import os
