@@ -101,6 +101,23 @@ jobs:
               print('gist_preflight_error=' + type(exc).__name__)
               raise SystemExit(2)
           PY
+      - name: Materialize the IPv6 helper credentials
+        shell: bash
+        env:
+          V6_HELPER_KEY: ${{ secrets.V6_HELPER_KEY }}
+          V6_HELPER_KNOWN_HOSTS: ${{ secrets.V6_HELPER_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$V6_HELPER_KEY"
+          test -n "$V6_HELPER_KNOWN_HOSTS"
+          mkdir -p "$RUNNER_TEMP/v6"
+          printf '%s\n' "$V6_HELPER_KEY" > "$RUNNER_TEMP/v6/id_ed25519"
+          chmod 600 "$RUNNER_TEMP/v6/id_ed25519"
+          printf '%s\n' "$V6_HELPER_KNOWN_HOSTS" > "$RUNNER_TEMP/v6/known_hosts"
+          chmod 600 "$RUNNER_TEMP/v6/known_hosts"
+          echo "PROBE_V6_SSH_KEY=$RUNNER_TEMP/v6/id_ed25519" >> "$GITHUB_ENV"
+          echo "PROBE_V6_SSH_KNOWN_HOSTS=$RUNNER_TEMP/v6/known_hosts" >> "$GITHUB_ENV"
       - name: Measure all original sources and publish Gist
         env:
           SUBSTORE_BASE: ${{ secrets.SUBSTORE_BASE }}
@@ -111,6 +128,14 @@ jobs:
           PROBE_CONCURRENCY: '8'
           PROBE_GEO_LOOKUP: '1'
           PROBE_SOURCES_JSON: ${{ inputs.sources_json }}
+          # IPv6-bound nodes cannot be dialled from an IPv4-only runner. The
+          # helper is a host with a real global IPv6 route; it settles exactly
+          # those nodes over one SSH session and returns verdicts. The runner
+          # stays the only writer of the Gist.
+          PROBE_V6_HELPER: ${{ secrets.V6_HELPER_HOST }}
+          PROBE_V6_SSH_PORT: ${{ secrets.V6_HELPER_PORT }}
+          PROBE_V6_MIHOMO: /opt/probe-v6/bin/mihomo
+          PROBE_V6_WORKERS: '4'
         run: |
           set -euo pipefail
           umask 077

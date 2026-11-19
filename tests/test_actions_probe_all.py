@@ -876,5 +876,54 @@ class NodeLevelPolicyTests(unittest.TestCase):
         self.assertFalse(direct.uses_front)
 
 
+class V6WorkerMergeTests(unittest.TestCase):
+    """A v6-capable helper settles what an IPv4-only runner cannot."""
+
+    def result(self, alive=0, unverifiable=3, measured=0):
+        r = p.SourceResult("src", 3, alive, 0, None)
+        r.unverifiable = unverifiable
+        r.measured = measured
+        return r
+
+    def test_promotes_answered_nodes_and_shrinks_unverifiable(self):
+        result = self.result()
+        payload = {"host_ipv6": True,
+                   "judged": {"src": 2},
+                   "results": {"src": {"n1": {"alive": True, "ip": "2a0e:97c0::1", "cc": "HK"},
+                                       "n2": {"alive": True, "ip": "2a0e:97c0::2", "cc": "JP"}}}}
+        merged = p.merge_v6_results([result], payload)
+        self.assertEqual(merged[0].alive, 2)
+        self.assertEqual(merged[0].measured, 2)
+        self.assertEqual(merged[0].unverifiable, 1)      # one was never judged
+        self.assertEqual(merged[0].countries, {"HK": 1, "JP": 1})
+
+    def test_dialled_and_silent_becomes_death_evidence(self):
+        result = self.result()
+        payload = {"host_ipv6": True, "judged": {"src": 3}, "results": {"src": {}}}
+        merged = p.merge_v6_results([result], payload)
+        # Every node the helper dialled failed: no longer unverifiable, so the
+        # source can finally be proven dead.
+        self.assertEqual(merged[0].unverifiable, 0)
+        self.assertEqual(merged[0].alive, 0)
+
+    def test_inert_when_the_helper_has_no_ipv6(self):
+        result = self.result()
+        payload = {"host_ipv6": False, "judged": {"src": 3}, "results": {"src": {}}}
+        merged = p.merge_v6_results([result], payload)
+        self.assertEqual(merged[0].unverifiable, 3)
+
+    def test_malformed_payload_never_changes_anything(self):
+        for payload in (None, {}, {"host_ipv6": True}, {"host_ipv6": True, "judged": "x"},
+                        {"host_ipv6": True, "judged": {"src": "nope"}},
+                        {"host_ipv6": True, "judged": {"src": 1}, "results": {"src": {"n": {"alive": True, "ip": "not-ip", "cc": "HK"}}}},
+                        {"host_ipv6": True, "judged": {"src": 1}, "results": {"src": {"n": {"alive": True, "ip": "8.8.8.8", "cc": "ZZ"}}}},
+                        {"host_ipv6": True, "judged": {"src": 1}, "results": {"src": {"n": {"alive": True, "ip": "127.0.0.1", "cc": "HK"}}}}):
+            with self.subTest(payload=payload):
+                result = self.result()
+                merged = p.merge_v6_results([result], payload)
+                self.assertEqual(merged[0].alive, 0)
+                self.assertEqual(merged[0].unverifiable, 3)
+
+
 if __name__ == "__main__":
     unittest.main()
