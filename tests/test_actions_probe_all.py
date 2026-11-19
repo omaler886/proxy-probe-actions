@@ -1066,9 +1066,16 @@ class SourceSecretsTests(unittest.TestCase):
                    "SOURCE_SECRETS_JSON": json.dumps({"机场A": {"header": {"Authorization": "Bearer abc123"}}})}
             code, summary = p.run(env, transport, probe)
             self.assertEqual(code, 0)
-            download_headers = [h for url, h in seen.items() if "/download/" in url]
-            self.assertEqual(len(download_headers), 1)
-            self.assertEqual(download_headers[0].get("Authorization"), "Bearer abc123")
+            # 机场A carries the credential; the default internal front sub
+            # (cf-front) never does.
+            downloads = {url: h for url, h in seen.items() if "/download/" in url}
+            self.assertEqual(len(downloads), 2)
+            authed = [url for url, h in downloads.items() if h.get("Authorization") == "Bearer abc123"]
+            self.assertEqual(len(authed), 1)
+            self.assertIn("机场A", p.urllib.parse.unquote(authed[0]))
+            front = [h for url, h in downloads.items() if "cf-front" in url]
+            self.assertEqual(len(front), 1)
+            self.assertNotIn("Authorization", front[0])
             self.assertNotIn("abc123", json.dumps(summary))
 
 
