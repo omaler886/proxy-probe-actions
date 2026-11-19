@@ -9,11 +9,42 @@ Private execution repository. Subscription data and API tokens never belong in G
 3. Request `https://www.cloudflare.com/cdn-cgi/trace` through a node-specific loopback HTTP listener, with certificate validation and no direct fallback. Only a successful trace with a global `ip` and valid `loc` counts as alive.
 4. Rename from source/country/protocol/exit hash/connection fingerprint. Timing is not embedded in names.
 5. For **GlaDOS only**, group successful nodes by actual trace exit IP. For a duplicate-exit group prefer Shadowsocks (`ss`); if the group has no SS, keep one deterministic member. A unique exit is retained regardless of protocol (including AnyTLS/Trojan). This is NOT a global SS-only filter. Other sources keep their protocols and are not collapsed by exit.
-6. PATCH fixed files in the existing secret Gist. Preserve failed/empty/severely reduced sources from the previous successful publication. Retain unrelated Gist files. Same YAML content produces no new revision. GitHub Gist PATCH rejects `If-Match` (HTTP 400); instead serialize this workflow and recheck the managed-file snapshot before writing. This is not server-side atomic compare-and-swap: never add a second writer for these managed filenames.
+6. PATCH fixed files in the existing secret Gist. Retain unrelated Gist files. Same YAML content produces no new revision. GitHub Gist PATCH rejects `If-Match` (HTTP 400); instead serialize this workflow and recheck the managed-file snapshot before writing. This is not server-side atomic compare-and-swap: never add a second writer for these managed filenames.
+
+## Failure policy (node-level, with a grace round)
+
+A source is **not** frozen as a whole when it fails. Each round records how many
+of its nodes were actually dialled (`measured`), how many were unusable
+configuration (`invalid`) and how many could not be judged because the host
+cannot reach IPv6 (`unverifiable`). A node counts as dead **only** when this
+round dialled it and the attempt failed.
+
+| Round result | Artifact |
+|---|---|
+| any alive, at least half of the previous count | replaced with this round's alive set |
+| any alive, fewer than half (severely reduced) | kept this round; replaced by the alive set on the **2nd consecutive** reduced round |
+| every dialled node failed | kept this round; **dropped** on the **2nd consecutive** round, so its dead nodes leave the merged subscription |
+| source could not be fetched | kept (nothing was proven) |
+| nodes hang off a dead front (`uses_front`) | kept (the front failed, not the nodes) |
+| nodes need IPv6 the host cannot reach | kept (unverifiable, never scored dead) |
+
+`bad_streak` in `manifest.json` is the consecutive-round counter that drives the
+grace. Only the survival baseline and that counter force a manifest-only
+revision; audit-only fields are allowed to lag so a failed round does not create
+revision noise.
+
 
 ## Trigger / cadence
 
-Actions → **All subscription probes** → Run workflow. The optional `sources_json` input accepts a JSON list (for example `["ikunkun","pokenmen","健康中心","prologue","233pio","saki","glados"]`); duplicates are removed. An empty input keeps the full-source schedule. Scheduled every six hours at minute 23 (UTC), with one run at a time. GitHub scheduled execution is best effort and may be delayed. Runner location/reachability is different from HK/CN/LXC; an IPv6-only or location-restricted node may fail from GitHub even when reachable elsewhere.
+Actions → **All subscription probes** → Run workflow. The optional `sources_json` input accepts a JSON list (for example `["ikunkun","pokenmen","健康中心","prologue","233pio","saki","glados"]`); duplicates are removed. An empty input keeps the full-source schedule. Scheduled every six hours at minute 23 (UTC), with one run at a time. GitHub scheduled execution is best effort and may be delayed.
+
+**IPv6 is a host capability, not a node property.** GitHub-hosted runners have
+no global IPv6 route, so a node whose server address (or whose front's address)
+is an IPv6 literal cannot be dialled there. Such a node is reported as
+`unverifiable`, never as dead, and the round summary records the host verdict in
+`ipv6`. A v6-bound node is only measured when the probe runs on an IPv6-capable
+host. Runner location/reachability is also different from HK/CN/LXC; a
+location-restricted node may fail from GitHub even when reachable elsewhere.
 
 ## Secrets
 

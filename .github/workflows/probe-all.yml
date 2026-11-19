@@ -29,6 +29,20 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check PyYAML==6.0.3
           python -m unittest discover -s tests -v
+      - name: Report host IPv6 capability
+        run: |
+          set -euo pipefail
+          # The runner's IPv6 reachability decides whether a v6-bound node can
+          # be judged at all. Record the verdict instead of assuming it: an
+          # unreachable node must never be published as dead.
+          python - <<'PY'
+          import json, sys
+          sys.path.insert(0, 'scripts')
+          from actions_probe_all import host_ipv6_capable
+          print('host_ipv6_capable=' + json.dumps(host_ipv6_capable()))
+          PY
+          ip -6 addr show scope global || true
+          ip -6 route show default || true
       - name: Install pinned kernel
         shell: bash
         run: |

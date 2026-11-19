@@ -34,7 +34,14 @@ def candidate(source="airport", count=1):
     graph = p.Graph(config)
     measurements = [p.Measurement(n["name"], "8.8.8." + str(i + 1), "US") for i, n in enumerate(config["proxies"])]
     text, published = p.source_output(source, graph, measurements)
-    return p.SourceResult(source, count, count, published, text)
+    return p.SourceResult(source, count, count, published, text, measured=count)
+
+
+def dead(source="airport", input_count=10, **kwargs):
+    """A source whose every node failed this round."""
+    result = p.SourceResult(source, input_count, 0, 0, "proxies: []\n", **kwargs)
+    result.measured = input_count
+    return result
 
 
 class FakeGist:
@@ -352,13 +359,26 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(remote.patches, [])
         self.assertEqual(remote.files, self.old)
 
-    def test_fail_zero_and_severe_drop_keep_old(self):
-        for result in (p.SourceResult("airport", failed=True), p.SourceResult("airport", input=100, alive=0, content="proxies: []\n"), candidate(count=1)):
-            with self.subTest(result=result):
-                remote = FakeGist(self.old)
-                self.assertEqual(self.publisher(remote).publish([result])[0], "no_change")
-                self.assertEqual(remote.files, self.old)
-                self.assertEqual(remote.patches, [])
+    def test_source_failure_keeps_old_without_a_revision(self):
+        # A source we could not even fetch proves nothing: the artifact stays
+        # and no Gist revision is created for an audit-only change.
+        remote = FakeGist(self.old)
+        self.assertEqual(self.publisher(remote).publish([p.SourceResult("airport", failed=True)])[0], "no_change")
+        self.assertEqual(remote.files, self.old)
+        self.assertEqual(remote.patches, [])
+
+    def test_first_failing_round_keeps_the_artifact_and_records_the_grace(self):
+        remote = FakeGist(self.old)
+        status, files = self.publisher(remote).publish([dead()])
+        self.assertEqual(status, "published")
+        # The artifact itself is untouched: one bad round never empties it.
+        self.assertEqual(remote.files[p.source_file("airport")], self.old[p.source_file("airport")])
+        state = json.loads(remote.files["manifest.json"])["sources"][p.source_file("airport")]
+        self.assertEqual(state["guard"], "zero_alive")
+        self.assertEqual(state["bad_streak"], 1)
+        self.assertTrue(state["preserved"])
+        # Only the manifest moved; the subscription body did not.
+        self.assertEqual(list(remote.patches[0]), ["manifest.json"])
 
     def test_first_run_all_failures_never_publishes_empty(self):
         for old in ({}, {"mihomo-alive.yaml": self.old["mihomo-alive.yaml"], "hb-full.yaml": "untouched"}):
@@ -574,8 +594,9 @@ class NativeTests(unittest.TestCase):
             return cfg["listeners"][0]["proxy"] != "bad"
 
         with mock.patch.object(probe, "validate", side_effect=validate), mock.patch.object(probe, "health", return_value=True) as health, mock.patch.object(probe, "trace", side_effect=[None, ("8.8.8.8", "US")]) as trace, mock.patch.object(p.subprocess, "Popen", return_value=process):
-            measured, invalid = probe(graph, ["bad", "ok"])
+            measured, invalid, unverifiable = probe(graph, ["bad", "ok"])
         self.assertEqual(invalid, 1)
+        self.assertEqual(unverifiable, 0)
         self.assertEqual([m.name for m in measured], ["ok"])
         self.assertEqual(trace.call_count, 2)
         self.assertEqual(health.call_count, 2)
@@ -596,9 +617,10 @@ class NativeTests(unittest.TestCase):
         probe = p.NativeProbe("mihomo")
         graph = p.Graph({"proxies": [node(**{"dialer-proxy": "missing"})]})
         with mock.patch.object(probe, "validate") as validate, mock.patch.object(p.subprocess, "Popen") as start:
-            measured, invalid = probe(graph, ["node"])
+            measured, invalid, unverifiable = probe(graph, ["node"])
         self.assertEqual(measured, [])
         self.assertEqual(invalid, 1)
+        self.assertEqual(unverifiable, 0)
         validate.assert_not_called()
         start.assert_not_called()
 
@@ -638,7 +660,7 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("?target=ClashMeta", url)
             return p.canonical({"proxies": [node()]}).encode(), {}
         def probe(graph, roots):
-            return [p.Measurement(name, "8.8.8.8", "US") for name in roots], 0
+            return [p.Measurement(name, "8.8.8.8", "US") for name in roots], 0, 0
         with tempfile.TemporaryDirectory() as temp:
             env = {"SUBSTORE_BASE": "https://fixture.invalid/SECRET", "PROBE_OUTPUT_DIR": temp, "GIST_TOKEN": "fixture\r\n", "GIST_ID": "abc123", "PROBE_FRONT_SUB": "", "PROBE_SOURCES_JSON": json.dumps(names + ["prologue"])}
             code, summary = p.run(env, transport, probe)
@@ -676,7 +698,7 @@ class RunnerTests(unittest.TestCase):
             return p.canonical({"proxies": [node()]}).encode(), {}
 
         def probe(graph, roots):
-            return [p.Measurement(root, "8.8.8.8", "US") for root in roots], 0
+            return [p.Measurement(root, "8.8.8.8", "US") for root in roots], 0, 0
 
         with tempfile.TemporaryDirectory() as temp:
             env = {"SUBSTORE_BASE": "https://fixture.invalid/private", "PROBE_OUTPUT_DIR": temp}
@@ -719,6 +741,139 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertEqual(summary["failure"], 1)
             self.assertEqual((Path(temp) / p.source_file("airport")).read_text(), old)
+
+
+class NodeLevelPolicyTests(unittest.TestCase):
+    """Node-level cleanup: a node proven dead must leave the subscription."""
+
+    def setUp(self):
+        self.old = p.plan_updates([candidate(count=4)], {})
+
+    def publish(self, files, results):
+        remote = FakeGist(files)
+        status, plan = p.GistPublisher("abc123", "not-a-real-token", remote).publish(results)
+        return remote, status
+
+    def state(self, remote):
+        return json.loads(remote.files["manifest.json"])["sources"][p.source_file("airport")]
+
+    def test_second_consecutive_zero_alive_round_drops_the_dead_nodes(self):
+        remote, status = self.publish(self.old, [dead()])
+        self.assertEqual(status, "published")
+        # Round one: the artifact is kept, only the grace counter moves.
+        self.assertIn(p.source_file("airport"), remote.files)
+        self.assertEqual(self.state(remote)["bad_streak"], 1)
+        self.assertEqual(self.state(remote)["guard"], "zero_alive")
+        # Round two: every node was judged and failed, so the artifact and its
+        # dead nodes are removed.
+        remote, status = self.publish(remote.files, [dead()])
+        self.assertEqual(status, "published")
+        self.assertNotIn(p.source_file("airport"), remote.files)
+        self.assertEqual(yaml.safe_load(remote.files["mihomo-alive.yaml"])["proxies"], [])
+        self.assertEqual(self.state(remote)["guard"], "confirmed_dead")
+        self.assertEqual(self.state(remote)["last_success_alive"], 0)
+        self.assertIn(p.source_file("airport"), remote.patches[0])
+        self.assertIsNone(remote.patches[0][p.source_file("airport")])
+
+    def test_dead_source_is_kept_while_the_front_is_down(self):
+        # The nodes hang off a front that is dead: their failure proves
+        # nothing about the nodes themselves.
+        result = dead(uses_front=True, front_alive=False)
+        for _ in range(3):
+            remote, status = self.publish(remote.files if "remote" in dir() else self.old, [result])
+            self.assertIn(p.source_file("airport"), remote.files)
+            self.assertEqual(self.state(remote)["bad_streak"], 0)
+            self.assertNotIn(p.source_file("airport"), remote.patches[0] if remote.patches else {})
+
+    def test_front_measured_alive_makes_the_death_attributable(self):
+        result = dead(uses_front=True, front_alive=True)
+        remote, status = self.publish(self.old, [result])
+        self.assertEqual(self.state(remote)["bad_streak"], 1)
+
+    def test_ipv6_unverifiable_nodes_are_never_scored_dead(self):
+        result = dead(input_count=4)
+        result.unverifiable = 4
+        result.measured = 0
+        remote, status = self.publish(self.old, [result])
+        for _ in range(4):
+            self.assertIn(p.source_file("airport"), remote.files)
+            self.assertEqual(self.state(remote)["bad_streak"], 0)
+            remote, status = self.publish(remote.files, [result])
+
+    def test_degraded_source_publishes_only_the_alive_nodes_after_the_grace(self):
+        remote, status = self.publish(self.old, [candidate(count=1)])
+        self.assertEqual(status, "published")
+        # Round one: the reduced set is held back.
+        self.assertEqual(remote.files[p.source_file("airport")], self.old[p.source_file("airport")])
+        self.assertEqual(self.state(remote)["bad_streak"], 1)
+        # Round two: only the node that measured alive survives.
+        remote, status = self.publish(remote.files, [candidate(count=1)])
+        self.assertEqual(status, "published")
+        self.assertEqual(len(yaml.safe_load(remote.files[p.source_file("airport")])["proxies"]), 1)
+        self.assertEqual(len(yaml.safe_load(remote.files["mihomo-alive.yaml"])["proxies"]), 1)
+        self.assertEqual(self.state(remote)["guard"], "degraded")
+
+    def test_v6_bound_node_is_unverifiable_on_an_ipv4_only_host(self):
+        graph = p.Graph({"proxies": [node("v6node", server="2606:4700:4700::1111"), node("v4node")]})
+        probe = p.NativeProbe("mihomo", ipv6=False)
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(probe, "validate", return_value=True) as validate, mock.patch.object(probe, "health", return_value=True), mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US")), mock.patch.object(p.subprocess, "Popen", return_value=process):
+            measured, invalid, unverifiable = probe(graph, ["v6node", "v4node"])
+        self.assertEqual(unverifiable, 1)
+        self.assertEqual(invalid, 0)
+        self.assertEqual([m.name for m in measured], ["v4node"])
+        # The IPv6 node is never dialled: every validated config is the IPv4 one.
+        self.assertEqual(len(validate.call_args_list), 2)  # per-root + combined
+        for call in validate.call_args_list:
+            self.assertNotIn("2606:4700:4700::1111", str(call.args[1]))
+
+    def test_v6_bound_node_is_measured_on_an_ipv6_capable_host(self):
+        graph = p.Graph({"proxies": [node("v6node", server="2606:4700:4700::1111")]})
+        probe = p.NativeProbe("mihomo", ipv6=True)
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(probe, "validate", return_value=True), mock.patch.object(probe, "health", return_value=True), mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US")), mock.patch.object(p.subprocess, "Popen", return_value=process):
+            measured, invalid, unverifiable = probe(graph, ["v6node"])
+        self.assertEqual(unverifiable, 0)
+        self.assertEqual(len(measured), 1)
+
+    def test_host_ipv6_capability_is_a_route_lookup(self):
+        class DeadRoute:
+            def __init__(self, family, kind):
+                pass
+            def connect(self, address):
+                raise OSError("network unreachable")
+            def close(self):
+                pass
+        class LiveRoute(DeadRoute):
+            def connect(self, address):
+                return None
+        with mock.patch.object(p.socket, "socket", return_value=DeadRoute(0, 0)):
+            self.assertFalse(p.host_ipv6_capable())
+        with mock.patch.object(p.socket, "socket", return_value=LiveRoute(0, 0)):
+            self.assertTrue(p.host_ipv6_capable())
+
+    def test_ipv6_override_parsing(self):
+        self.assertIsNone(p.ipv6_override(None))
+        self.assertIsNone(p.ipv6_override(""))
+        self.assertIsNone(p.ipv6_override("maybe"))
+        for text in ("1", "true", "YES", " on "):
+            self.assertIs(p.ipv6_override(text), True, text)
+        for text in ("0", "false", "No", " off "):
+            self.assertIs(p.ipv6_override(text), False, text)
+
+    def test_measure_source_marks_front_dependent_sources(self):
+        config = {"proxies": [node("root", **{"dialer-proxy": "front"})]}
+        front = {"proxies": [node("front")]}
+        probe = p.NativeProbe("mihomo", ipv6=True)
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(probe, "validate", return_value=True), mock.patch.object(probe, "health", return_value=True), mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US")), mock.patch.object(p.subprocess, "Popen", return_value=process):
+            chained = p.measure_source("chained", config, front, probe)
+            direct = p.measure_source("direct", {"proxies": [node("solo")]}, front, probe)
+        self.assertTrue(chained.uses_front)
+        self.assertFalse(direct.uses_front)
 
 
 if __name__ == "__main__":

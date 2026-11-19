@@ -92,6 +92,57 @@ def selected_source(name: str) -> bool:
             and name not in {"测活-DMIT", "官方可用"})
 
 
+def is_v6_literal(server) -> bool:
+    """True when the address is an IPv6 literal (not a hostname)."""
+    try:
+        return ipaddress.ip_address(str(server)).version == 6
+    except ValueError:
+        return False
+
+
+def host_ipv6_capable(override=None) -> bool:
+    """True when this host has a usable global IPv6 route.
+
+    A node whose server address is an IPv6 literal can only be dialled from a
+    host that can reach IPv6. GitHub-hosted runners are IPv4-only, so such a
+    node is unreachable FROM HERE. That is a property of the runner, not of
+    the node: the node may well be alive on the user's own IPv6 network.
+    Scoring it "dead" would silently delete a working node, so the probe
+    reports it as unverifiable instead. The check is a route lookup (a UDP
+    connect), not a probe: no packet leaves the host.
+
+    ``override`` (env ``PROBE_IPV6=0/1``) forces the verdict, which is what the
+    A/B harness uses to exercise both branches on one machine.
+    """
+    if override is not None:
+        return bool(override)
+    if not socket.has_ipv6:
+        return False
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    except OSError:
+        return False
+    try:
+        sock.connect(("2606:4700:4700::1111", 53))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def ipv6_override(value):
+    """``PROBE_IPV6`` -> True/False/None (unset = detect the host)."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
 def canonical(value) -> str:
     return yaml.safe_dump(value, allow_unicode=True, sort_keys=True, width=100000)
 
@@ -331,6 +382,53 @@ class Graph:
             visit(root)
         return nodes, groups
 
+    def dial_servers(self, root):
+        """Every server address the runner must dial to reach this root.
+
+        The root's own server plus the whole dialer chain: a node whose
+        FRONT is an IPv6 literal needs IPv6 just as much as a node whose own
+        address is one.
+        """
+        servers, stack, seen = [], [root], set()
+        while stack:
+            name = stack.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            if name in self.nodes:
+                item = self.nodes[name]
+                server = item.get("server")
+                if isinstance(server, str) and server:
+                    servers.append(server)
+                ref = self.dependency(item)
+                if ref:
+                    stack.append(ref)
+            elif name in self.groups:
+                for ref in self.groups[name].get("proxies") or []:
+                    stack.append(ref)
+        return servers
+
+    def v6_bound(self, root) -> bool:
+        """True when reaching this root requires an IPv6 literal address."""
+        return any(is_v6_literal(server) for server in self.dial_servers(root))
+
+    def front_backed(self, roots, front_only) -> bool:
+        """True when any root's dial chain reaches a node supplied by the front.
+
+        Such a source cannot blame its own nodes for a dead round: the front
+        may be the reason every measurement failed.
+        """
+        if not front_only:
+            return False
+        for root in roots:
+            try:
+                nodes, _ = self.closure([root])
+            except ProbeError:
+                continue
+            if nodes & front_only:
+                return True
+        return False
+
     def export(self, roots, names=None):
         nodes, groups = self.closure(roots)
         names = names or {name: name for name in nodes | groups}
@@ -414,14 +512,29 @@ class SourceResult:
     error: str = ""
     unique_egress: int = 0
     countries: dict = field(default_factory=dict)
+    #: Roots this round actually dialled. Roots with an unusable configuration
+    #: are invalid; roots that need IPv6 on an IPv4-only host are unverifiable.
+    measured: int = 0
+    #: Roots whose configuration the kernel refused (unusable, not merely down).
+    invalid: int = 0
+    #: Roots this round could NOT judge because the host cannot reach IPv6.
+    unverifiable: int = 0
+    #: The source's nodes are dialled through the front subscription.
+    uses_front: bool = False
+    #: Front health this round: True alive, False dead, None not measured.
+    front_alive: bool | None = None
 
 
 class NativeProbe:
-    def __init__(self, binary, workers=8, timeout=15, transport=None):
+    def __init__(self, binary, workers=8, timeout=15, transport=None, ipv6=None):
         self.binary = binary
         self.workers = max(1, min(32, int(workers)))
         self.timeout = max(1, min(120, int(timeout)))
         self.transport = transport or Transport(timeout=2)
+        # IPv6 capability is a HOST property. When the host cannot reach IPv6,
+        # a node with an IPv6 literal server is unverifiable from here, never
+        # dead: it may be alive on the user's own IPv6 network.
+        self.ipv6 = host_ipv6_capable() if ipv6 is None else bool(ipv6)
 
     def validate(self, directory, cfg):
         path = Path(directory) / "config.yaml"
@@ -463,13 +576,21 @@ class NativeProbe:
             return False
 
     def __call__(self, graph, roots):
-        accepted, invalid = [], 0
+        accepted, invalid, unverifiable = [], 0, 0
+        measurable = []
+        for root in roots:
+            if not self.ipv6 and graph.v6_bound(root):
+                # Unreachable FROM THIS HOST, not proven dead. Do not spend a
+                # timeout on it and do not let it count as a dead node.
+                unverifiable += 1
+                continue
+            measurable.append(root)
         with tempfile.TemporaryDirectory(prefix="actions-probe-") as temp:
             directory = private_dir(temp)
             secret = secrets.token_urlsafe(24)
             # Each root's complete closure is checked independently: an unsupported
             # protocol cannot poison an otherwise healthy source.
-            for root in roots:
+            for root in measurable:
                 try:
                     ports = unused_ports(2)
                     cfg = kernel_config(graph, [root], ports[:1], ports[1], secret)
@@ -482,7 +603,7 @@ class NativeProbe:
                         raise
                     invalid += 1
             if not accepted:
-                return [], invalid
+                return [], invalid, unverifiable
             ports = unused_ports(len(accepted) + 1)
             controller = ports[-1]
             cfg = kernel_config(graph, accepted, ports[:-1], controller, secret)
@@ -509,7 +630,7 @@ class NativeProbe:
                     measured = list(pool.map(one, zip(accepted, ports[:-1])))
                 if not self.health(process, controller, secret):
                     raise ProbeError("kernel_end_failure")
-                return [item for item in measured if item], invalid
+                return [item for item in measured if item], invalid, unverifiable
             except OSError:
                 raise ProbeError("kernel_execution_failure") from None
             finally:
@@ -649,8 +770,18 @@ def measure_source(name, config, front, probe):
     try:
         graph = Graph(dedupe_names(config), front)
         roots = [item["name"] for item in config["proxies"]]
-        measurements, invalid = probe(graph, roots)
+        # Nodes the FRONT supplies (the source's own definitions win). A root
+        # that reaches one of them cannot be blamed for its own failures.
+        front_only = set()
+        if front:
+            own = {item.get("name") for item in config.get("proxies", []) if isinstance(item, dict)}
+            front_only = {item.get("name") for item in front.get("proxies", []) if isinstance(item, dict)} - own
+        result.uses_front = graph.front_backed(roots, front_only)
+        measurements, invalid, unverifiable = probe(graph, roots)
         result.alive = len(measurements)
+        result.invalid = invalid
+        result.unverifiable = unverifiable
+        result.measured = max(0, len(roots) - invalid - unverifiable)
         result.unique_egress = len({egress_key(item.ip) for item in measurements})
         for item in measurements:
             result.countries[item.cc] = result.countries.get(item.cc, 0) + 1
@@ -712,6 +843,12 @@ def merge_sources(contents):
     return canonical(result)
 
 
+#: Consecutive failing rounds a source must accumulate before its artifact is
+#: replaced by the reduced measurement or dropped entirely. One bad round is
+#: never enough: a transient network failure must not empty a subscription.
+BAD_STREAK_LIMIT = 2
+
+
 def plan_updates(results, old):
     try:
         old_manifest = json.loads(old.get("manifest.json", "{}"))
@@ -726,6 +863,7 @@ def plan_updates(results, old):
     # to the source filter, otherwise the feedback loop lives on in the manifest.
     effective = {key: value for key, value in old.items() if SOURCE_FILE.fullmatch(key)}
     manifest = {"version": 1, "sources": copy.deepcopy(previous)}
+    dropped = set()
     for filename in list(manifest["sources"]):
         stored = manifest["sources"][filename].get("name", "")
         if isinstance(stored, str) and stored.lower().startswith("gist-"):
@@ -743,8 +881,41 @@ def plan_updates(results, old):
         if not prior_alive and filename in effective:
             doc = yaml.safe_load(effective[filename])
             prior_alive = sum(not item.get("name", "").startswith("__front-") for item in doc.get("proxies", []))
-        accept = not result.failed and result.content is not None and result.alive > 0 and result.alive >= prior_alive * 0.5
-        guard = "accepted" if accept else ("source_failure" if result.failed else "zero_alive" if not result.alive else "ratio_drop" if result.alive < prior_alive * 0.5 else "candidate_invalid")
+        try:
+            streak = max(0, int(last.get("bad_streak", 0)))
+        except (ValueError, TypeError):
+            streak = 0
+        # Death evidence. A node counts as dead only when THIS round dialled it
+        # and the attempt failed. A source we could not fetch, a source whose
+        # nodes hang off a dead front, and a node that needs IPv6 on an
+        # IPv4-only host are all UNPROVEN: they must never delete a node.
+        proven_dead = (not result.failed
+                       and result.alive == 0
+                       and result.unverifiable == 0
+                       and (not result.uses_front or result.front_alive is True))
+        if result.failed:
+            accept, guard = False, "source_failure"
+        elif result.alive > 0:
+            if prior_alive and result.alive < prior_alive * 0.5:
+                # Severely reduced. The surviving set is node-level truth, but
+                # a single bad round must not shrink a good subscription: the
+                # reduced set replaces the old one only after the second
+                # consecutive reduced round.
+                streak += 1
+                accept = streak >= BAD_STREAK_LIMIT
+                guard = "degraded" if accept else "ratio_drop"
+            else:
+                accept, guard, streak = True, "accepted", 0
+        elif proven_dead:
+            # Every node this round could judge failed. The artifact is
+            # dropped so its dead nodes leave the subscription; the grace
+            # period keeps one bad round from doing that.
+            streak += 1
+            accept = False
+            guard = "confirmed_dead" if streak >= BAD_STREAK_LIMIT else "zero_alive"
+        else:
+            accept = False
+            guard = "unverifiable" if result.unverifiable else "zero_alive"
         if accept:
             try:
                 candidate = yaml.safe_load(result.content)
@@ -757,6 +928,20 @@ def plan_updates(results, old):
                 accept = False
             if not accept:
                 guard = "candidate_invalid"
+        if guard == "confirmed_dead" and streak >= BAD_STREAK_LIMIT:
+            # Node-level cleanup: the dead nodes leave the subscription and the
+            # source file is removed on the same PATCH.
+            effective.pop(filename, None)
+            dropped.add(filename)
+            manifest["sources"][filename] = {
+                "name": result.name, "input": result.input, "alive": 0,
+                "published": 0, "last_success_alive": 0,
+                "preserved": False, "guard": "confirmed_dead",
+                "measured": result.measured, "invalid": result.invalid,
+                "unverifiable": result.unverifiable, "bad_streak": streak,
+                "uses_front": result.uses_front,
+            }
+            continue
         if accept:
             effective[filename] = result.content
         published = result.published if accept else last.get("published", prior_alive)
@@ -764,8 +949,20 @@ def plan_updates(results, old):
             "name": result.name, "input": result.input, "alive": result.alive,
             "published": published, "last_success_alive": result.alive if accept else prior_alive,
             "preserved": not accept, "guard": guard,
+            "measured": result.measured, "invalid": result.invalid,
+            "unverifiable": result.unverifiable, "bad_streak": streak,
+            "uses_front": result.uses_front,
         }
-    merged = merge_sources(effective) if effective else old.get("mihomo-alive.yaml", canonical({"proxies": []}))
+    if effective:
+        merged = merge_sources(effective)
+    elif dropped:
+        # Every source was proven dead this round: the merged body must drop
+        # the nodes too, otherwise the dead nodes survive in the subscription.
+        merged = canonical({"proxies": []})
+    else:
+        # Nothing published yet and nothing dropped: keep whatever the previous
+        # round produced rather than writing an empty subscription.
+        merged = old.get("mihomo-alive.yaml", canonical({"proxies": []}))
     for filename, content in effective.items():
         entry = manifest["sources"].setdefault(filename, {})
         entry["sha256"] = digest(content)
@@ -774,6 +971,39 @@ def plan_updates(results, old):
     files["mihomo-alive.yaml"] = merged
     files["manifest.json"] = json_text(manifest)
     return files
+
+
+def manifest_state_changed(old_text, new_text) -> bool:
+    """True when the manifest carries state the next round's decision needs.
+
+    The survival baseline (``last_success_alive``) and the grace counter
+    (``bad_streak``) decide whether a source is republished or dropped, so
+    they must reach the Gist. Audit-only fields (guard, preserved, counts)
+    may lag: a failed round must not create a revision on its own.
+    """
+    try:
+        old = json.loads(old_text or "{}").get("sources", {})
+        new = json.loads(new_text or "{}").get("sources", {})
+    except (ValueError, TypeError, AttributeError):
+        return True
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return True
+    for key, entry in new.items():
+        previous = old.get(key)
+        if not isinstance(entry, dict):
+            continue
+        if not isinstance(previous, dict):
+            if entry.get("last_success_alive") or entry.get("bad_streak"):
+                return True
+            continue
+        if entry.get("last_success_alive") != previous.get("last_success_alive"):
+            return True
+        if (entry.get("bad_streak") or 0) != (previous.get("bad_streak") or 0):
+            return True
+    for key in old:
+        if key not in new:
+            return True
+    return False
 
 
 class GistPublisher:
@@ -821,7 +1051,10 @@ class GistPublisher:
     def _publish_once(self, results):
         old, _ = self.current()  # No PATCH at all if any read/parse/guard fails.
         files = plan_updates(results, old)
-        if not any(SOURCE_FILE.fullmatch(name) for name in files):
+        # A source whose nodes were all proven dead leaves the plan; its file
+        # is deleted on the same PATCH so its dead nodes cannot be pulled.
+        deletions = {name for name in old if SOURCE_FILE.fullmatch(name) and name not in files}
+        if not any(SOURCE_FILE.fullmatch(name) for name in files) and not deletions:
             # A completely failed first run must not create an empty subscription.
             return "no_change", files
         # Compare EVERY canonical YAML, not just the merged projection: another
@@ -829,15 +1062,16 @@ class GistPublisher:
         # Counts/status alone must never produce standalone manifest revisions.
         yaml_updates = {name: {"content": text} for name, text in files.items()
                         if name != "manifest.json" and digest(text) != digest(old.get(name, ""))}
-        if not yaml_updates and not any(
-                SOURCE_FILE.fullmatch(name) and name not in files for name in old):
+        manifest_changed = digest(files["manifest.json"]) != digest(old.get("manifest.json", ""))
+        state_changed = manifest_state_changed(old.get("manifest.json"), files["manifest.json"])
+        if not yaml_updates and not deletions and not state_changed:
             return "no_change", files
         updates = dict(yaml_updates)
-        # A file dropped from the plan (self-referential artifact cleanup) is
-        # deleted on the same PATCH, so the stale subscription cannot be pulled.
-        updates.update({name: None for name in old
-                        if SOURCE_FILE.fullmatch(name) and name not in files})
-        if digest(files["manifest.json"]) != digest(old.get("manifest.json", "")):
+        # A file dropped from the plan (self-referential artifact cleanup, or a
+        # source whose nodes were all proven dead) is deleted on the same
+        # PATCH, so the stale subscription cannot be pulled.
+        updates.update({name: None for name in deletions})
+        if manifest_changed and (yaml_updates or deletions or state_changed):
             updates["manifest.json"] = {"content": files["manifest.json"]}
         # GitHub Gist PATCH rejects If-Match (HTTP 400): no atomic CAS exists
         # for this endpoint. Serialize our writer in Actions. Re-read managed
@@ -869,7 +1103,10 @@ def result_reports(results, files=None):
                         "dedup_kept": item.published, "published": state.get("published", 0),
                         "failed": item.failed, "preserved": state.get("preserved", True),
                         "guard": state.get("guard", "pending"), "error_code": item.error,
-                        "unique_egress": item.unique_egress, "countries": item.countries})
+                        "unique_egress": item.unique_egress, "countries": item.countries,
+                        "measured": item.measured, "unverifiable": item.unverifiable,
+                        "bad_streak": state.get("bad_streak", 0),
+                        "uses_front": item.uses_front})
     return reports
 
 
@@ -877,6 +1114,7 @@ def run(env=None, transport=None, probe=None):
     env = dict(os.environ if env is None else env)
     results, sources, output = [], [], None
     requested = bool(env.get("PROBE_SOURCES_JSON", "").strip())
+    override = ipv6_override(env.get("PROBE_IPV6"))
     summary = {"sources": 0, "input": 0, "alive": 0, "failure": 0,
                "phase": "init", "error_code": "", "publication": "not_started"}
     try:
@@ -892,7 +1130,7 @@ def run(env=None, transport=None, probe=None):
                 raise ProbeError("kernel_missing")
             if not shutil.which("curl"):
                 raise ProbeError("curl_missing")
-            probe = NativeProbe(binary, env.get("PROBE_CONCURRENCY", 8), env.get("PROBE_TIMEOUT", 15))
+            probe = NativeProbe(binary, env.get("PROBE_CONCURRENCY", 8), env.get("PROBE_TIMEOUT", 15), ipv6=override)
         summary["phase"] = "sources"
         sources = store.sources()
         if requested:
@@ -929,7 +1167,17 @@ def run(env=None, transport=None, probe=None):
             if name in configs:
                 results.append(measure_source(name, configs[name], front, probe))
         results.sort(key=lambda item: sources.index(item.name))
+        # Front health decides whether a front-dependent source may be judged
+        # dead: with a dead front, its nodes failed for someone else's reason.
+        front_result = next((item for item in results if item.name == front_name), None)
+        front_alive = None
+        if front_result is not None:
+            front_alive = bool(not front_result.failed and front_result.alive > 0)
+        for item in results:
+            item.front_alive = front_alive
         summary.update(input=sum(item.input for item in results), alive=sum(item.alive for item in results), failure=sum(item.failed or not item.alive for item in results))
+        summary["ipv6"] = getattr(probe, "ipv6", None)
+        summary["unverifiable"] = sum(item.unverifiable for item in results)
         if requested:
             summary["results"] = result_reports(results)
         summary["phase"] = "checkpoint"
