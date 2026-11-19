@@ -1214,6 +1214,12 @@ def measure_v6_out_of_band(results, configs, env):
                "workers": int(env.get("PROBE_V6_WORKERS", 4)),
                "jobs": jobs}
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    # Pin the algorithms. A hardened helper may offer a post-quantum KEX that
+    # some clients refuse outright, which shows up as a handshake failure
+    # rather than an auth problem.
+    command += ["-o", "KexAlgorithms=ecdh-sha2-nistp256,curve25519-sha256",
+                "-o", "HostKeyAlgorithms=ssh-ed25519,rsa-sha2-512,rsa-sha2-256",
+                "-o", "PubkeyAcceptedAlgorithms=ssh-ed25519"]
     key = env.get("PROBE_V6_SSH_KEY", "").strip()
     if key:
         # The helper is a pinned host: the key file is a secret and the host
@@ -1229,13 +1235,19 @@ def measure_v6_out_of_band(results, configs, env):
                "python3 /opt/probe-v6/scripts/v6_worker.py"]
     try:
         run = subprocess.run(command, input=json_text(payload).encode(),
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              timeout=int(env.get("PROBE_V6_TIMEOUT", 900)))
     except (OSError, subprocess.SubprocessError):
         report["error"] = "helper_unreachable"
         return report
     if run.returncode != 0:
         report["error"] = "helper_failed"
+        # The ssh client explains itself on stderr (refused, host key, kex).
+        # Keep the first line only: it names a host or an option, never a key.
+        first = run.stderr.decode("utf-8", "replace").strip().splitlines()
+        if first:
+            report["detail"] = first[0][:120]
+        report["rc"] = run.returncode
         return report
     try:
         answer = json.loads(run.stdout.decode("utf-8", "replace"))
