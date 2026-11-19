@@ -648,8 +648,43 @@ class NativeProbe:
         except Exception:
             return False
 
+    def _valid_batch(self, directory, graph, batch, secret):
+        """One kernel validation over a batch's complete closures.
+
+        Infrastructure failures (missing kernel, subprocess timeout) still
+        raise; a root the graph or the kernel rejects only fails THIS batch,
+        which is what the bisection in _assess needs.
+        """
+        try:
+            ports = unused_ports(len(batch) + 1)
+            cfg = kernel_config(graph, batch, ports[:-1], ports[-1], secret)
+        except ProbeError as exc:
+            if str(exc).startswith("kernel_"):
+                raise
+            return False
+        return self.validate(directory, cfg)
+
+    def _assess(self, directory, graph, batch, secret, accepted, invalid):
+        """Validate a batch of roots; bisect on failure to isolate bad ones.
+
+        Group testing: the measurement kernel runs every accepted root as one
+        config anyway, so one mihomo -t covers the whole batch. A single bad
+        member fails the batch, so a failing batch is split and each half is
+        re-tested; k bad roots among n cost O(k log(n/k)) kernel calls instead
+        of n, and the common all-healthy case is exactly one call.
+        """
+        if self._valid_batch(directory, graph, batch, secret):
+            accepted.extend(batch)
+            return
+        if len(batch) == 1:
+            invalid.append(batch[0])
+            return
+        mid = len(batch) // 2
+        self._assess(directory, graph, batch[:mid], secret, accepted, invalid)
+        self._assess(directory, graph, batch[mid:], secret, accepted, invalid)
+
     def __call__(self, graph, roots):
-        accepted, invalid, unverifiable = [], 0, 0
+        accepted, invalid, unverifiable = [], [], 0
         measurable = []
         for root in roots:
             if not self.ipv6 and graph.v6_bound(root):
@@ -661,22 +696,11 @@ class NativeProbe:
         with tempfile.TemporaryDirectory(prefix="actions-probe-") as temp:
             directory = private_dir(temp)
             secret = secrets.token_urlsafe(24)
-            # Each root's complete closure is checked independently: an unsupported
-            # protocol cannot poison an otherwise healthy source.
-            for root in measurable:
-                try:
-                    ports = unused_ports(2)
-                    cfg = kernel_config(graph, [root], ports[:1], ports[1], secret)
-                    if self.validate(directory, cfg):
-                        accepted.append(root)
-                    else:
-                        invalid += 1
-                except ProbeError as exc:
-                    if str(exc).startswith("kernel_"):
-                        raise
-                    invalid += 1
+            # Unsupported protocols and unusable definitions are isolated by
+            # batch bisection; an unhealthy root cannot poison its source.
+            self._assess(directory, graph, measurable, secret, accepted, invalid)
             if not accepted:
-                return [], invalid, unverifiable
+                return [], len(invalid), unverifiable
             ports = unused_ports(len(accepted) + 1)
             controller = ports[-1]
             cfg = kernel_config(graph, accepted, ports[:-1], controller, secret)
@@ -703,7 +727,7 @@ class NativeProbe:
                     measured = list(pool.map(one, zip(accepted, ports[:-1])))
                 if not self.health(process, controller, secret):
                     raise ProbeError("kernel_end_failure")
-                return [item for item in measured if item], invalid, unverifiable
+                return [item for item in measured if item], len(invalid), unverifiable
             except OSError:
                 raise ProbeError("kernel_execution_failure") from None
             finally:
@@ -1297,7 +1321,9 @@ def run(env=None, transport=None, probe=None):
     requested = bool(env.get("PROBE_SOURCES_JSON", "").strip())
     override = ipv6_override(env.get("PROBE_IPV6"))
     summary = {"sources": 0, "input": 0, "alive": 0, "failure": 0,
-               "phase": "init", "error_code": "", "publication": "not_started"}
+               "phase": "init", "error_code": "", "publication": "not_started",
+               "timings": {}}
+    started = time.monotonic()
     try:
         base = env.get("SUBSTORE_BASE", "").strip()
         if not base or not env.get("PROBE_OUTPUT_DIR", "").strip():
@@ -1329,13 +1355,25 @@ def run(env=None, transport=None, probe=None):
         if not sources:
             raise ProbeError("sources_empty")
         summary["phase"] = "fetch"
-        # Fetch EVERY selected source this round; no history skip.
+        # Fetch EVERY selected source this round; no history skip. The GETs
+        # are independent and I/O bound, so they share a small thread pool;
+        # urllib opens a fresh connection per call and Transport keeps no
+        # per-request state between them.
         configs = {}
-        for name in sources:
+        mark = time.monotonic()
+
+        def fetch_one(name):
             try:
-                configs[name] = store.config(name)
+                return name, store.config(name), ""
             except Exception as exc:
-                results.append(SourceResult(name, failed=True, error=error_code(exc)))
+                return name, None, error_code(exc)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(sources))) as pool:
+            for name, config, failure in pool.map(fetch_one, sources):
+                if failure:
+                    results.append(SourceResult(name, failed=True, error=failure))
+                else:
+                    configs[name] = config
         front_name = env.get("PROBE_FRONT_SUB", "cf-front")
         front = configs.get(front_name)
         if front is None and front_name and selected_source(front_name) and front_name not in sources:
@@ -1343,18 +1381,26 @@ def run(env=None, transport=None, probe=None):
                 front = store.config(front_name)
             except Exception:
                 pass  # Individual missing dependencies fail closed in Graph.
+        summary["timings"]["fetch_s"] = round(time.monotonic() - mark, 1)
         summary["phase"] = "measure"
+        mark = time.monotonic()
         for name in sources:
             if name in configs:
                 results.append(measure_source(name, configs[name], front, probe))
         results.sort(key=lambda item: sources.index(item.name))
+        summary["timings"]["measure_s"] = round(time.monotonic() - mark, 1)
         # IPv6-bound nodes cannot be dialled from an IPv4-only host. When a
         # helper with real IPv6 is configured, hand it exactly those nodes: it
         # settles them (alive, or proven dead) and this round is rebuilt from
         # the union. Without a helper they stay unverifiable, which is honest.
         helper = env.get("PROBE_V6_HELPER", "").strip()
         if helper and env.get("PROBE_V6_SSH_PORT"):
+            mark = time.monotonic()
             summary["v6_helper"] = measure_v6_out_of_band(results, configs, env)
+            summary["timings"]["helper_s"] = round(time.monotonic() - mark, 1)
+        # Geolocation runs inside source_output's prefetch (runner round and
+        # helper rebuild alike); the resolver accumulates its own wall time.
+        summary["timings"]["geo_s"] = round(geo_naming.PREFETCH_SECONDS, 1)
         # Front health decides whether a front-dependent source may be judged
         # dead: with a dead front, its nodes failed for someone else's reason.
         front_result = next((item for item in results if item.name == front_name), None)
@@ -1379,6 +1425,7 @@ def run(env=None, transport=None, probe=None):
         if not any(not item.failed and item.alive > 0 and item.published > 0 for item in results):
             raise ProbeError("no_successful_roots")
         summary["phase"] = "publish"
+        mark = time.monotonic()
         if env.get("GIST_TOKEN"):
             gist_id = env.get("GIST_ID", env.get("GITHUB_GIST_ID", ""))
             status, files = GistPublisher(gist_id, env["GIST_TOKEN"], transport).publish(results)
@@ -1386,12 +1433,14 @@ def run(env=None, transport=None, probe=None):
         else:
             files = plan_updates(results, read_local(output))
             summary["publication"] = "local_only"
+        summary["timings"]["publish_s"] = round(time.monotonic() - mark, 1)
         if requested:
             summary["results"] = result_reports(results, files)
         summary["phase"] = "output"
         for name, content in files.items():
             private_write(output / name, content)
         summary["phase"] = "complete"
+        summary["timings"]["total_s"] = round(time.monotonic() - started, 1)
         private_write(output / "measurement.json", json_text(dict(summary, results=result_reports(results, files))))
         # A partial source failure is recorded in the summary, but a successful
         # guarded publication is a successful workflow outcome. Exit nonzero only

@@ -168,6 +168,10 @@ LOOKUP_ON = os.environ.get("PROBE_GEO_LOOKUP", "0") == "1"
 IPWHO_BUDGET = int(os.environ.get("PROBE_IPWHO_BUDGET", "600"))
 _TIMEOUT = float(os.environ.get("PROBE_GEO_TIMEOUT", "6"))
 
+#: Cumulative wall seconds spent in geolocation lookups (diagnostic for the
+#: run summary's ``timings.geo_s``). prefetch runs on the probe's main thread.
+PREFETCH_SECONDS = 0.0
+
 
 def _flag(cc):
     cc = (cc or "").upper()
@@ -475,6 +479,14 @@ class Resolver:
 
     def prefetch(self, items):
         """items: [(exit_ip, fallback_cc)]. Missing/failed lookups degrade only."""
+        global PREFETCH_SECONDS
+        started = time.monotonic()
+        try:
+            self._prefetch(items)
+        finally:
+            PREFETCH_SECONDS += time.monotonic() - started
+
+    def _prefetch(self, items):
         wanted = {}
         for ip, cc in items:
             if ip and ip not in self._cache:
@@ -495,19 +507,29 @@ class Resolver:
                 if hit[0]:
                     local[ip] = hit
         cymru, ipapi, ipwho = {}, {}, {}
+        # The local dump already answered the ASN for these exits; Cymru is
+        # the RIR-authoritative source but costs one DoH round trip per IP,
+        # so it is only queried for addresses the dump does not cover.
+        cymru_ips = [ip for ip in ips if ip not in local] if local else ips
 
         def _cy(ip):
             return ip, cymru_asn_cc(ip)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(ips))) as pool:
-            for ip, result in pool.map(_cy, ips):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(cymru_ips) or 1)) as pool:
+            for ip, result in pool.map(_cy, cymru_ips):
                 if result and (result[0] or result[1]):
                     cymru[ip] = result
         try:
             ipapi = _ipapi_batch(ips)
         except Exception:
             ipapi = {}
-        remaining = [min(IPWHO_BUDGET, len(ips))]
+        # ipwho.is is the only per-IP HTTPS call left: ip-api (batch) and the
+        # dump already cover cc/asn/org, so only the gaps pay for it. A fully
+        # answered exit loses only its zone-level naming discriminator.
+        gaps = [ip for ip in ips
+                if not (ipapi.get(ip) or {}).get("cc")
+                or not (ipapi.get(ip) or {}).get("asname")]
+        remaining = [min(IPWHO_BUDGET, len(gaps))]
 
         def _who(ip):
             if remaining[0] <= 0:
@@ -515,8 +537,8 @@ class Resolver:
             remaining[0] -= 1
             return ip, _ipwho(ip)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(ips))) as pool:
-            for ip, result in pool.map(_who, ips):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(gaps) or 1)) as pool:
+            for ip, result in pool.map(_who, gaps):
                 if result:
                     ipwho[ip] = result
         with self._lock:

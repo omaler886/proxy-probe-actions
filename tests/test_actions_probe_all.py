@@ -600,8 +600,39 @@ class NativeTests(unittest.TestCase):
         self.assertEqual([m.name for m in measured], ["ok"])
         self.assertEqual(trace.call_count, 2)
         self.assertEqual(health.call_count, 2)
-        self.assertEqual(len(calls), 3)
+        # Group testing: one failing batch + one call per half + the combined
+        # measurement config (not one call per root).
+        self.assertEqual(len(calls), 4)
         process.terminate.assert_called_once()
+
+    def test_one_bad_root_in_a_batch_costs_log_calls_not_n(self):
+        """Group testing: 1 bad root among 32 stays O(log n), not O(n)."""
+        names = ["bad"] + ["ok-%d" % i for i in range(31)]
+        graph = p.Graph({"proxies": [node(name) for name in names]})
+        probe = p.NativeProbe("mihomo")
+        process = mock.Mock()
+        process.poll.return_value = None
+        calls = []
+
+        def validate(directory, cfg):
+            calls.append(cfg)
+            return all(lane["proxy"] != "bad" for lane in cfg["listeners"])
+
+        with mock.patch.object(probe, "validate", side_effect=validate), mock.patch.object(probe, "health", return_value=True), mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US")), mock.patch.object(p.subprocess, "Popen", return_value=process):
+            measured, invalid, unverifiable = probe(graph, names)
+        self.assertEqual(invalid, 1)
+        self.assertEqual([m.name for m in measured], ["ok-%d" % i for i in range(31)])
+        self.assertEqual(unverifiable, 0)
+        # batch + 5 failing halves + 5 passing siblings + combined config
+        self.assertLess(len(calls), 16)
+
+    def test_all_invalid_batch_starts_no_kernel(self):
+        graph = p.Graph({"proxies": [node("bad1"), node("bad2")]})
+        probe = p.NativeProbe("mihomo")
+        with mock.patch.object(probe, "validate", return_value=False), mock.patch.object(p.subprocess, "Popen") as start:
+            measured, invalid, unverifiable = probe(graph, ["bad1", "bad2"])
+        self.assertEqual((measured, invalid, unverifiable), ([], 2, 0))
+        start.assert_not_called()
 
     def test_dead_kernel_at_end_discards_measurements(self):
         graph = p.Graph({"proxies": [node()]})

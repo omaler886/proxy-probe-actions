@@ -129,7 +129,9 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
           MIHOMO_BIN: ${{ runner.temp }}/bin/mihomo
           PROBE_OUTPUT_DIR: ${{ runner.temp }}/probe-output
-          PROBE_CONCURRENCY: '8'
+          # Tracing is I/O bound (one curl per node against one shared kernel),
+          # well under NativeProbe's 32-worker clamp on a 4-core runner.
+          PROBE_CONCURRENCY: '24'
           PROBE_GEO_LOOKUP: '1'
           PROBE_SOURCES_JSON: ${{ inputs.sources_json }}
           # IPv6-bound nodes cannot be dialled from an IPv4-only runner. The
@@ -140,7 +142,7 @@ jobs:
           PROBE_V6_SSH_PORT: ${{ secrets.V6_HELPER_PORT }}
           PROBE_V6_SSH_USER: ${{ secrets.V6_HELPER_USER }}
           PROBE_V6_MIHOMO: /opt/probe-v6/bin/mihomo
-          PROBE_V6_WORKERS: '4'
+          PROBE_V6_WORKERS: '12'
         run: |
           set -euo pipefail
           umask 077
