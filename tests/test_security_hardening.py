@@ -3,7 +3,6 @@ import base64
 import concurrent.futures
 import hashlib
 import importlib.util
-import io
 import json
 import os
 from pathlib import Path
@@ -318,8 +317,8 @@ class PublicationBoundaryTests(unittest.TestCase):
         probe.Graph(parsed).closure([node["name"] for node in parsed["proxies"]])
 
 
-class HttpsAndHelperTests(unittest.TestCase):
-    """Enforce encrypted fetches and a pinned, restricted helper destination."""
+class HttpsAndProcessTests(unittest.TestCase):
+    """Enforce encrypted fetches and isolated local child processes."""
 
     def test_insecure_or_malformed_urls_fail_without_transport_calls(self):
         """Reject HTTP, embedded credentials, control characters and invalid ports."""
@@ -337,37 +336,6 @@ class HttpsAndHelperTests(unittest.TestCase):
             store.config("source")
         store.transport.assert_not_called()
 
-    def test_helper_receives_only_target_closure_including_external_front(self):
-        """Unrelated source nodes and provider definitions must not leave the runner."""
-        config = {"proxies": [make_node("target", server="2606:4700::1111", **{"dialer-proxy": "front"}),
-                               make_node("unrelated")], "proxy-providers": {"secret": {"url": "private"}}}
-        front = {"proxies": [make_node("front", server="front.invalid"), make_node("unused-front")]}
-        job = probe.build_v6_job("source", config, front)
-        self.assertEqual(job["roots"], ["target"])
-        self.assertEqual({node["name"] for node in job["config"]["proxies"]}, {"target", "front"})
-        self.assertNotIn("proxy-providers", job["config"])
-        self.assertNotIn("unrelated", json.dumps(job))
-
-    def test_duplicate_v6_labels_keep_their_distinct_normalized_roots(self):
-        """Minimizing a helper payload must not silently collapse repeated labels."""
-        config = {"proxies": [make_node("same", server="2606:4700::1111"),
-                               make_node("same", server="2606:4700::1001")]}
-        job = probe.build_v6_job("source", config)
-        self.assertEqual(job["roots"], ["same", "same#2"])
-
-    def test_helper_answer_rebuilds_a_source_with_external_front_dependencies(self):
-        """A promoted IPv6 result must keep the exact external front it was measured with."""
-        config = {"proxies": [make_node("target", server="2606:4700::1111", **{"dialer-proxy": "front"})]}
-        front = {"proxies": [make_node("front", server="front.invalid")]}
-        job = probe.prepare_source("source", config, front, mock.Mock(ipv6=False))
-        result = probe.finish_source(job, [], 0, 1)
-        payload = {"host_ipv6": True, "judged": {"source": 1},
-                   "results": {"source": {"target": {"alive": True, "ip": "8.8.8.8", "cc": "US"}}}}
-        report = probe.apply_v6([result], payload, {"source": config}, {"error": ""}, front)
-        self.assertEqual(report["error"], "")
-        self.assertEqual(result.published, 1)
-        self.assertEqual(len(yaml.safe_load(result.content)["proxies"]), 2)
-
     def test_transport_rejects_cross_origin_source_redirect_before_forwarding_credentials(self):
         """A source redirect cannot send its Authorization header to another host."""
         transport = probe.Transport(retries=0)
@@ -383,48 +351,37 @@ class HttpsAndHelperTests(unittest.TestCase):
         self.assertEqual(probe.NativeProbe.negotiation(b""), (False, "", 0))
         self.assertEqual(probe.NativeProbe.negotiation(b"2"), (False, "", 0))
 
-    def test_helper_rejects_root_and_missing_host_pinning(self):
-        """Unsafe helper settings return a fixed error and execute no SSH command."""
-        env = {"PROBE_V6_HELPER": "helper.invalid", "PROBE_V6_SSH_PORT": "22",
-               "PROBE_V6_SSH_USER": "root"}
-        with mock.patch.object(probe.subprocess, "run") as run:
-            report, answer = probe.request_v6([{"roots": ["n"]}], env)
-        self.assertIsNone(answer)
-        self.assertEqual(report["error"], "helper_config_invalid")
-        run.assert_not_called()
-        env["PROBE_V6_SSH_USER"] = "probe-v6"
-        with self.assertRaises(probe.ProbeError):
-            probe.validate_helper(env)
+    def test_local_children_do_not_inherit_tokens_proxy_settings_or_ssh_agents(self):
+        """Validation and trace commands inherit only the existing process essentials."""
+        environment = {"PATH": "fixture-path", "TEMP": "fixture-temp",
+                       "GIST_TOKEN": "private-token", "PROBE_STATE_TOKEN": "private-state",
+                       "SOURCE_SECRETS_JSON": "private-source", "SSH_AUTH_SOCK": "private-agent",
+                       "PROBE_V6_SSH_KEY": "private-key", "HTTPS_PROXY": "private-proxy"}
+        local = probe.NativeProbe("mihomo", ipv6=True)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+                os.environ, environment, clear=True), mock.patch.object(
+                probe.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=b"")) as run:
+            self.assertTrue(local.validate(directory, {"proxies": []}))
+            self.assertIsNone(local.trace(12345, directory))
+        self.assertEqual([call.args[0][0] for call in run.call_args_list], ["mihomo", "curl"])
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["env"], {"PATH": "fixture-path", "TEMP": "fixture-temp"})
 
-    def test_helper_binary_is_fixed_and_ssh_children_have_no_action_tokens(self):
-        """Inspect the SSH argv, JSON payload and inherited process environment."""
-        with tempfile.TemporaryDirectory() as directory:
-            key, known = Path(directory) / "key", Path(directory) / "known"
-            key.write_text("fixture-key")
-            known.write_text("fixture-host-key")
-            env = {"PROBE_V6_HELPER": "helper.invalid", "PROBE_V6_SSH_PORT": "22",
-                   "PROBE_V6_SSH_USER": "probe-v6", "PROBE_V6_SSH_KEY": str(key),
-                   "PROBE_V6_SSH_KNOWN_HOSTS": str(known), "PROBE_V6_MIHOMO": "/tmp/attacker"}
-            with mock.patch.dict(os.environ, {"GIST_TOKEN": "must-not-inherit"}), mock.patch.object(
-                    probe.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=b'{}')) as run:
-                probe.request_v6([{"roots": ["n"]}], env)
-        command = run.call_args.args[0]
-        self.assertIn("StrictHostKeyChecking=yes", command)
-        self.assertIn("IdentityAgent=none", command)
-        self.assertNotIn("GIST_TOKEN", run.call_args.kwargs["env"])
-        self.assertNotIn("mihomo", json.loads(run.call_args.kwargs["input"]))
-        self.assertIn("probe-v6@helper.invalid", command)
-
-    def test_worker_refuses_root_before_reading_credentials(self):
-        """A root account must fail without consuming the SSH payload."""
-        path = Path(__file__).resolve().parents[1] / "scripts" / "v6_worker.py"
-        spec = importlib.util.spec_from_file_location("security_v6_worker", path)
-        worker = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(worker)
-        with mock.patch.object(worker.os, "geteuid", return_value=0, create=True), mock.patch.object(
-                worker.sys, "stdin") as stream, mock.patch("sys.stdout", new_callable=io.StringIO):
-            self.assertEqual(worker.main(), 2)
-            stream.buffer.read.assert_not_called()
+    def test_native_ipv6_result_keeps_external_front_dependencies(self):
+        """Successful runner measurements retain the exact front dependency closure."""
+        config = {"proxies": [make_node("target", server="2606:4700::1111",
+                                        **{"dialer-proxy": "front"})]}
+        front = {"proxies": [make_node("front", server="front.invalid"), make_node("unused")]}
+        local = probe.NativeProbe("mihomo", ipv6=True)
+        evidence = [(("8.8.8.8", "US", "2", 20), 0)]
+        with mock.patch.object(local, "validate", return_value=True), mock.patch.object(
+                local, "_run_kernel", return_value=(evidence, False, set())):
+            result = probe.measure_source("source", config, front, local)
+        self.assertFalse(result.failed)
+        self.assertEqual(result.published, 1)
+        document = yaml.safe_load(result.content)
+        self.assertEqual(len(document["proxies"]), 2)
+        self.assertNotIn("unused", json.dumps(document))
 
 
 class OfflineGeoAndConcurrencyTests(unittest.TestCase):

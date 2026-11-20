@@ -47,6 +47,7 @@ import yaml
 # in isolation (offline) and replaced without touching the probe contract.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import geo_naming  # noqa: E402
+from ipv6_transport import check_ipv6_connectivity  # noqa: E402
 from publication import DeliveryGist, PrivateStateStore, PublicationError  # noqa: E402
 from probe_limits import EndpointLimiter, choose_workers, interleave_endpoints  # noqa: E402
 
@@ -55,6 +56,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 SOURCE_FILE = re.compile(r"source-[0-9a-f]{64}\.yaml\Z")
 BUILTINS = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL"}
+IPV6_UDP_ADAPTERS = {"hysteria", "hysteria2", "tuic", "wireguard", "masque"}
 # Non-connection annotations must not change the stable connection identity.
 ANNOTATIONS = {"name", "_probe_state", "_probe", "dialer-proxy", "dialer_proxy",
                "detour", "benchmark", "latency", "delay"}
@@ -66,7 +68,6 @@ class ProbeError(Exception):
 
 
 ERROR_CODES = set("trace_invalid github_redirect response_large upstream_redirect transport_failure redirect_limit base_invalid sources_invalid source_secrets_invalid subscription_invalid definition_invalid definition_duplicate definition_collision dependency_invalid dependency_cycle_or_direct dependency_missing kernel_validation_failure kernel_config_failure kernel_start_failure kernel_end_failure kernel_execution_failure old_content_invalid namespace_collision manifest_invalid gist_id_invalid gist_token_invalid gist_not_private gist_raw_invalid environment_missing kernel_missing curl_missing sources_empty sources_filter_invalid sources_filter_missing no_successful_roots gist_conflict http_failure request_invalid non_proxy_outbound dependency_group_unsupported".split())
-ERROR_CODES.add("helper_config_invalid")
 
 
 def error_code(exc):
@@ -112,34 +113,10 @@ def is_v6_literal(server) -> bool:
 
 
 def host_ipv6_capable(override=None) -> bool:
-    """True when this host has a usable global IPv6 route.
-
-    A node whose server address is an IPv6 literal can only be dialled from a
-    host that can reach IPv6. GitHub-hosted runners are IPv4-only, so such a
-    node is unreachable FROM HERE. That is a property of the runner, not of
-    the node: the node may well be alive on the user's own IPv6 network.
-    Scoring it "dead" would silently delete a working node, so the probe
-    reports it as unverifiable instead. The check is a route lookup (a UDP
-    connect), not a probe: no packet leaves the host.
-
-    ``override`` (env ``PROBE_IPV6=0/1``) forces the verdict, which is what the
-    A/B harness uses to exercise both branches on one machine.
-    """
+    """Return verified host IPv6 connectivity, or the explicit fixture override."""
     if override is not None:
         return bool(override)
-    if not socket.has_ipv6:
-        return False
-    try:
-        sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    except OSError:
-        return False
-    try:
-        sock.connect(("2606:4700:4700::1111", 53))
-        return True
-    except OSError:
-        return False
-    finally:
-        sock.close()
+    return bool(check_ipv6_connectivity().get("ok", False))
 
 
 def ipv6_override(value):
@@ -170,81 +147,6 @@ def env_int(value, default, low=0, high=10 ** 9):
         return max(low, min(high, int(value)))
     except (TypeError, ValueError):
         return default
-
-
-def merge_v6_results(results, payload):
-    """Apply a v6 worker's verdicts to this round's source results.
-
-    A v6-bound node is unmeasurable from an IPv4-only host, so it is neither
-    alive nor dead here. A host WITH IPv6 can settle it. Only nodes the worker
-    actually dialled are settled:
-
-      * dialled and answered -> promotes the node to alive (its own exit IP);
-      * dialled and silent   -> PROVEN DEAD, so it stops being unverifiable and
-                               may count toward the source's death evidence;
-      * not dialled          -> stays unverifiable, unchanged.
-
-    ``payload`` is the worker's JSON (see ``scripts/v6_worker.py``). Anything
-    malformed is ignored: a broken helper must never change a publication.
-    """
-    if not isinstance(payload, dict) or not payload.get("host_ipv6"):
-        return results
-    judged = payload.get("judged") or {}
-    answers = payload.get("results") or {}
-    if not isinstance(judged, dict) or not isinstance(answers, dict):
-        return results
-    for result in results:
-        try:
-            count = int(judged.get(result.name) or 0)
-        except (TypeError, ValueError):
-            continue
-        if count <= 0:
-            continue
-        answered = answers.get(result.name) or {}
-        if not isinstance(answered, dict):
-            continue
-        # Only roots this round actually handed to the helper can be settled.
-        # An answer about any other name is either a version mismatch or a
-        # poisoned helper; promoting it would invent measurements, and the
-        # rebuild would then raise KeyError on a node that is not in the graph.
-        # One unknown name invalidates the whole source answer: the helper is
-        # not describing this round's job, so none of its verdicts are usable.
-        roots = set(result.v6_roots)
-        if any(name not in roots for name in answered):
-            continue
-        promoted = []
-        for name, verdict in answered.items():
-            if not isinstance(verdict, dict) or not verdict.get("alive"):
-                continue
-            ip, cc = verdict.get("ip"), verdict.get("cc")
-            if not isinstance(ip, str) or not isinstance(cc, str):
-                continue
-            try:
-                addr = ipaddress.ip_address(ip)
-            except ValueError:
-                continue
-            if not addr.is_global or cc not in COUNTRIES:
-                continue
-            delay = verdict.get("delay_ms")
-            if not isinstance(delay, int) or isinstance(delay, bool) or delay < 0:
-                delay = 0
-            promoted.append(Measurement(str(name), ip, cc, delay_ms=min(delay, 300000)))
-        # A node is proven dead only when the helper dialled it and said nothing
-        # about it. An answer we cannot parse proves nothing either way, so it
-        # must leave the node unverifiable instead of silently killing it.
-        silent = max(0, min(count, len(roots)) - len(answered))
-        settled = len(promoted) + silent
-        if not settled:
-            continue
-        result.measurements.extend(promoted)
-        result.alive = len(result.measurements)
-        result.unverifiable = max(0, result.unverifiable - settled)
-        result.measured += settled
-        result.unique_egress = len({egress_key(item.ip) for item in result.measurements})
-        result.countries = {}
-        for item in result.measurements:
-            result.countries[item.cc] = result.countries.get(item.cc, 0) + 1
-    return results
 
 
 def canonical(value) -> str:
@@ -734,12 +636,9 @@ class Measurement:
     name: str
     ip: str
     cc: str
-    #: Negotiated protocol from curl ("2", "1.1", ...); empty when unknown
-    #: (for example a v6 node settled by the helper, which does not report it).
+    #: Negotiated protocol from curl ("2", "1.1", ...); empty when unknown.
     http_version: str = ""
-    #: Round-trip milliseconds from the kernel's own delay probe. 0 means "no
-    #: evidence" (prefilter disabled, or the node was settled by the v6 helper),
-    #: never "0 ms".
+    #: Round-trip milliseconds from the delay probe or trace; 0 means unknown.
     delay_ms: int = 0
 
 
@@ -768,11 +667,6 @@ class SourceResult:
     uses_front: bool = False
     #: Front health this round: True alive, False dead, None not measured.
     front_alive: bool | None = None
-    #: Every alive measurement, kept so a v6 worker's verdicts can be merged in
-    #: and the source body rebuilt from the union.
-    measurements: list = field(default_factory=list)
-    #: Roots this round skipped because they need an IPv6 route the host lacks.
-    v6_roots: list = field(default_factory=list)
     #: Egress latency of alive nodes, from the kernel delay probe. Audit only:
     #: latency is never part of a connection fingerprint/name.
     delay_median_ms: int = 0
@@ -798,7 +692,7 @@ MAX_WORKERS = 256
 class SourceJob:
     """One source prepared for measurement, independent of the kernel shape.
 
-    Preparing (graph resolution, front attribution, v6 classification) is
+    Preparing (graph resolution and front attribution) is
     separate from measuring so several jobs can share one kernel and still be
     reported per source.
     """
@@ -808,7 +702,6 @@ class SourceJob:
     roots: list
     front_only: set
     uses_front: bool
-    v6_roots: list = field(default_factory=list)
 
 
 class NativeProbe:
@@ -851,10 +744,26 @@ class NativeProbe:
         self.kernel_batch = max(0, int(kernel_batch or 0))
         #: Collapse identical connection definitions within one source.
         self.dedupe = bool(dedupe)
-        # IPv6 capability is a HOST property. When the host cannot reach IPv6,
-        # a node with an IPv6 literal server is unverifiable from here, never
-        # dead: it may be alive on the user's own IPv6 network.
-        self.ipv6 = host_ipv6_capable() if ipv6 is None else bool(ipv6)
+        # A host transport failure cannot supply evidence that a node is dead.
+        self._ipv6_override = ipv6
+        self.ipv6_report = {"ok": bool(ipv6), "tcp_ok": bool(ipv6),
+                            "udp_ok": bool(ipv6), "checks": {}, "override": True}
+        self.refresh_ipv6_health()
+
+    def refresh_ipv6_health(self):
+        """Refresh automatic host checks; return the snapshot without checking overrides."""
+        if self._ipv6_override is None:
+            self.ipv6_report = check_ipv6_connectivity()
+        self.ipv6 = bool(self.ipv6_report.get("ok", False))
+        self.ipv6_udp = bool(self.ipv6_report.get("udp_ok", False))
+        return self.ipv6_report
+
+    def _ipv6_unverifiable(self, graph, root):
+        """Return whether a root's existing IPv6 gate lacks its required host transport."""
+        if not graph.v6_bound(root):
+            return False
+        adapter = str(graph.nodes.get(root, {}).get("type", "")).lower()
+        return not self.ipv6 or (adapter in IPV6_UDP_ADAPTERS and not self.ipv6_udp)
 
     def validate(self, directory, cfg):
         path = Path(directory) / "config.yaml"
@@ -1210,7 +1119,7 @@ class NativeProbe:
                 self.dedup_saved += len(job.roots) - len(groups)
             runnable = []
             for group in groups:
-                if not self.ipv6 and job.graph.v6_bound(group[0]):
+                if self._ipv6_unverifiable(job.graph, group[0]):
                     unverifiable[job_index] += len(group)
                     continue
                 runnable.append(group)
@@ -1240,6 +1149,8 @@ class NativeProbe:
         outcome = {(entry[0], entry[2]): evidence[index] for index, entry in enumerate(accepted)}
         rejected = {(accepted[index][0], accepted[index][2]) for index in skipped}
         invalid_keys = {(job_index, root) for job_index, job, root in invalid}
+        if accepted:
+            self.refresh_ipv6_health()
         results = []
         for job_index, job in enumerate(jobs):
             invalid_count = sum(len(group) for group in plans[job_index]
@@ -1253,7 +1164,7 @@ class NativeProbe:
                     continue
                 item, delay = value
                 if item is None or item is DIRECT_LEAK:
-                    if degraded and (job_index, group[0]) in outcome:
+                    if degraded or self._ipv6_unverifiable(job.graph, group[0]):
                         unverifiable[job_index] += len(group)
                     continue
                 ip, cc, version, elapsed_ms = item
@@ -1305,7 +1216,7 @@ class NativeProbe:
             self.dedup_saved += len(roots) - len(groups)
         measurable, unverifiable = [], 0
         for group in groups:
-            if not self.ipv6 and graph.v6_bound(group[0]):
+            if self._ipv6_unverifiable(graph, group[0]):
                 # Unreachable FROM THIS HOST, not proven dead. Do not spend a
                 # timeout on it and do not let it count as a dead node.
                 unverifiable += len(group)
@@ -1346,6 +1257,7 @@ class NativeProbe:
         index_of = {root: index for index, root in enumerate(accepted)}
         invalid_set = set(invalid)
         invalid_count = sum(len(group) for group in measurable if group[0] in invalid_set)
+        self.refresh_ipv6_health()
         measured = []
         for group in measurable:
             index = index_of.get(group[0])
@@ -1355,7 +1267,7 @@ class NativeProbe:
             if item is None or item is DIRECT_LEAK:
                 # A kernel that died at the end cannot turn its own silence
                 # into death evidence; the round's positives still stand.
-                if degraded:
+                if degraded or self._ipv6_unverifiable(graph, group[0]):
                     unverifiable += len(group)
                 continue
             ip, cc, version, elapsed_ms = item
@@ -1610,12 +1522,8 @@ def prepare_source(name, config, front, probe):
     if front:
         own = {item.get("name") for item in config.get("proxies", []) if isinstance(item, dict)}
         front_only = {item.get("name") for item in front.get("proxies", []) if isinstance(item, dict)} - own
-    job = SourceJob(name, config, graph, roots, front_only,
-                    graph.front_backed(roots, front_only))
-    # Roots this host could not dial for lack of IPv6, handed to the helper.
-    if getattr(probe, "ipv6", True) is False:
-        job.v6_roots = [root for root in roots if graph.v6_bound(root)]
-    return job
+    return SourceJob(name, config, graph, roots, front_only,
+                     graph.front_backed(roots, front_only))
 
 
 def finish_source(job, measurements, invalid, unverifiable, prefiltered=0):
@@ -1623,8 +1531,6 @@ def finish_source(job, measurements, invalid, unverifiable, prefiltered=0):
     result = SourceResult(job.name, input=len(job.config.get("proxies", [])))
     result.uses_front = job.uses_front
     result.alive = len(measurements)
-    result.measurements = list(measurements)
-    result.v6_roots = list(job.v6_roots)
     result.invalid = invalid
     result.unverifiable = unverifiable
     result.prefiltered = prefiltered
@@ -2328,159 +2234,6 @@ def result_reports(results, files=None):
     return reports
 
 
-def _ssh_target(env):
-    """Return an explicit non-root helper account; reject option-like hosts."""
-    host = str(env["PROBE_V6_HELPER"]).strip()
-    user = str(env.get("PROBE_V6_SSH_USER", "")).strip()
-    if (not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user) or user == "root"
-            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.:-]*", host)):
-        raise ProbeError("helper_config_invalid")
-    return user + "@" + host
-
-
-def validate_helper(env):
-    """Require pinned SSH identity, host key and a valid non-root destination."""
-    target = _ssh_target(env)
-    try:
-        port = int(env.get("PROBE_V6_SSH_PORT", ""))
-    except (TypeError, ValueError):
-        raise ProbeError("helper_config_invalid") from None
-    if not 1 <= port <= 65535:
-        raise ProbeError("helper_config_invalid")
-    for setting in ("PROBE_V6_SSH_KEY", "PROBE_V6_SSH_KNOWN_HOSTS"):
-        path = Path(str(env.get(setting, "")))
-        if not path.is_file() or not path.stat().st_size:
-            raise ProbeError("helper_config_invalid")
-    return target
-
-
-def v6_bound_roots(config, front=None):
-    """Roots whose dial chain needs an IPv6 literal. Pure graph work, no dial.
-
-    Computed from the fetched config *before* measuring so the helper can start
-    at the same time as the runner instead of waiting for it.
-    """
-    try:
-        graph = Graph(dedupe_names(config), front)
-    except ProbeError:
-        return []
-    roots = []
-    for item in config.get("proxies") or []:
-        name = item.get("name") if isinstance(item, dict) else None
-        if isinstance(name, str) and name in graph.nodes and graph.v6_bound(name):
-            roots.append(name)
-    return roots
-
-
-def build_v6_job(source, config, front=None):
-    """Export only valid IPv6 roots and their complete dependencies for the helper."""
-    normalized = dedupe_names(config)
-    graph = Graph(normalized, front)
-    roots = []
-    for root in v6_bound_roots(normalized, front):
-        try:
-            graph.closure([root])
-        except ProbeError:
-            continue  # Invalid roots remain unjudged; do not ship other credentials.
-        roots.append(root)
-    if not roots:
-        return None
-    return {"source": source, "config": graph.export(roots), "roots": roots}
-
-
-def request_v6(jobs, env):
-    """Ship one job list to the IPv6 helper and return ``(report, answer)``.
-
-    Runs concurrently with the runner's own measurement: nothing here depends
-    on this round's results, only on the fetched configs. ``answer`` is None
-    whenever any part of the exchange failed, so a broken helper can never
-    change a publication on a guess.
-    """
-    report = {"ok": False, "judged": 0, "promoted": 0, "error": ""}
-    if not jobs:
-        report["ok"] = True
-        return report, None
-    try:
-        target = validate_helper(env)
-    except ProbeError:
-        report["error"] = "helper_config_invalid"
-        return report, None
-    payload = {"timeout": env_int(env.get("PROBE_TIMEOUT"), 15, 1, 120),
-               "workers": env_int(env.get("PROBE_V6_WORKERS"), 48, 1, 64),
-               "per_endpoint": env_int(env.get("PROBE_PER_ENDPOINT_CONCURRENCY"), 8, 1, 64),
-               "jobs": jobs}
-    command = ["ssh", "-F", os.devnull, "-T", "-o", "BatchMode=yes",
-               "-o", "ConnectTimeout=10", "-o", "IdentityAgent=none",
-               "-o", "ClearAllForwardings=yes", "-o", "ForwardAgent=no"]
-    # Pin the algorithms. A hardened helper may offer a post-quantum KEX that
-    # some clients refuse outright, which shows up as a handshake failure
-    # rather than an auth problem.
-    command += ["-o", "KexAlgorithms=ecdh-sha2-nistp256,curve25519-sha256",
-                "-o", "HostKeyAlgorithms=ssh-ed25519,rsa-sha2-512,rsa-sha2-256",
-                "-o", "PubkeyAcceptedAlgorithms=ssh-ed25519"]
-    key = env["PROBE_V6_SSH_KEY"].strip()
-    known = env["PROBE_V6_SSH_KNOWN_HOSTS"].strip()
-    command += ["-i", key, "-o", "IdentitiesOnly=yes", "-o",
-                "UserKnownHostsFile=" + known, "-o", "StrictHostKeyChecking=yes",
-                "-o", "GlobalKnownHostsFile=" + os.devnull]
-    command += ["-p", str(env["PROBE_V6_SSH_PORT"]),
-               target,
-               "python3 /opt/probe-v6/scripts/v6_worker.py"]
-    try:
-        run = subprocess.run(command, input=json_text(payload).encode(),
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             timeout=env_int(env.get("PROBE_V6_TIMEOUT"), 900, 10, 1800),
-                             env=child_environment())
-    except (OSError, subprocess.SubprocessError):
-        report["error"] = "helper_unreachable"
-        return report, None
-    if run.returncode != 0:
-        report["error"] = "helper_failed"
-        report["rc"] = run.returncode
-        return report, None
-    try:
-        answer = json.loads(run.stdout.decode("utf-8", "replace"))
-    except ValueError:
-        report["error"] = "helper_answer_invalid"
-        return report, None
-    return report, answer
-
-
-def apply_v6(results, answer, configs, report, front=None):
-    """Merge the helper's verdicts into this round and rebuild affected files.
-
-    ``promoted`` is the number of measurements the helper actually added -- not
-    the alive count of every source that happened to own a v6 root, which made
-    the summary claim more promotions than the number of nodes it judged.
-    """
-    if not isinstance(answer, dict) or not answer.get("host_ipv6"):
-        report["error"] = report.get("error") or "helper_without_ipv6"
-        return report
-    before = sum(len(item.measurements) for item in results)
-    merge_v6_results(results, answer)
-    promoted = sum(len(item.measurements) for item in results) - before
-    for result in results:
-        if result.failed or not result.content:
-            continue
-        # Only a source that actually handed roots to the helper can have new
-        # measurements; re-exporting every other source would repeat its
-        # geolocation prefetch for nothing.
-        if result.v6_roots and result.measurements:
-            try:
-                graph = Graph(dedupe_names(configs[result.name]), front)
-                result.content, result.published = source_output(
-                    result.name, graph, result.measurements)
-            except Exception:
-                # A helper answer we cannot apply must not abort the round: the
-                # previous content stands and the report explains why.
-                report["error"] = "rebuild_failed"
-    report["ok"] = True
-    report["judged"] = sum(int(v or 0) for v in (answer.get("judged") or {}).values())
-    report["promoted"] = max(0, promoted)
-    report["helper_error_count"] = len(answer.get("errors") or [])
-    return report
-
-
 def publication_backends(env, transport):
     """Build and preflight private state and optional single-file Gist delivery."""
     has_delivery = bool(env.get("GIST_TOKEN") or env.get("GIST_ID"))
@@ -2621,31 +2374,6 @@ def run(env=None, transport=None, probe=None):
         # that comes back with this address never entered the proxy.
         if hasattr(probe, "baseline_ip"):
             probe.baseline_ip = runner_exit_ip(transport)
-        # IPv6-bound nodes cannot be dialled from an IPv4-only host. The helper
-        # settles exactly those, and its job list depends only on the fetched
-        # configs -- never on this round's results -- so it runs CONCURRENTLY
-        # with the runner instead of adding its whole wall time afterwards.
-        helper_pool = helper_future = None
-        helper_started = 0.0
-        # Only a host that cannot reach IPv6 needs the helper, and only a
-        # configured helper is worth the graph walk that finds its jobs.
-        if (getattr(probe, "ipv6", True) is False
-                and env.get("PROBE_V6_HELPER", "").strip()
-                and env.get("PROBE_V6_SSH_PORT")):
-            helper_jobs = []
-            for name in sources:
-                if name not in configs:
-                    continue
-                try:
-                    helper_job = build_v6_job(name, configs[name], front)
-                except ProbeError:
-                    helper_job = None
-                if helper_job:
-                    helper_jobs.append(helper_job)
-            if helper_jobs:
-                helper_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                helper_started = time.monotonic()
-                helper_future = helper_pool.submit(request_v6, helper_jobs, env)
         summary["phase"] = "measure"
         mark = time.monotonic()
         # One shared kernel for the whole round by default: 38 kernel starts
@@ -2657,29 +2385,14 @@ def run(env=None, transport=None, probe=None):
         # of its own, so nobody measured it and ``front_alive`` stayed None --
         # which froze every front-backed source's streak at zero forever. One
         # explicit measurement (health only, never published) makes attribution
-        # possible; a dead front must never delete a node. The verdict is read
-        # after the helper merge, so a v6 front that the helper settled counts.
+        # possible; a dead front must never delete a node.
         front_measured = None
         if front is not None and not any(item.name == front_name for item in results):
             front_measured = front_health(front, probe)
         results.sort(key=lambda item: sources.index(item.name))
         summary["timings"]["measure_s"] = round(time.monotonic() - mark, 1)
-        # Join the helper only after the runner's own round is done. In the
-        # common case it finished during measurement, so this wait is ~0.
-        if helper_future is not None:
-            mark = time.monotonic()
-            report, answer = helper_future.result()
-            summary["timings"]["helper_wait_s"] = round(time.monotonic() - mark, 1)
-            summary["v6_helper"] = report
-            if answer is not None:
-                apply_v6(results, answer, configs, report, front)
-            # helper_s is the helper's own wall time, not extra wall time: it
-            # overlaps measure_s by design, so the phases no longer sum to
-            # total_s. helper_wait_s is what the runner actually blocked on.
-            summary["timings"]["helper_s"] = round(time.monotonic() - helper_started, 1)
-            helper_pool.shutdown(wait=False)
-        # Geolocation runs inside source_output's prefetch (runner round and
-        # helper rebuild alike); the resolver accumulates its own wall time.
+        # Geolocation runs inside source_output's prefetch; the resolver
+        # accumulates its own wall time.
         summary["timings"]["geo_s"] = round(geo_naming.PREFETCH_SECONDS, 1)
         summary["asn_db"] = geo_naming.asn_db_status()
         front_result = next((item for item in results if item.name == front_name), None)
@@ -2691,6 +2404,18 @@ def run(env=None, transport=None, probe=None):
             item.front_alive = front_alive
         summary.update(input=sum(item.input for item in results), alive=sum(item.alive for item in results), failure=sum(item.failed or not item.alive for item in results))
         summary["ipv6"] = getattr(probe, "ipv6", None)
+        ipv6_report = getattr(probe, "ipv6_report", {})
+        summary["ipv6_transport"] = {}
+        if isinstance(ipv6_report, dict):
+            # Keep diagnostics aggregate-only even if a checker gains details.
+            summary["ipv6_transport"] = {
+                key: ipv6_report[key] for key in
+                ("ok", "tcp_ok", "udp_ok", "tcp_passed", "tcp_total",
+                 "udp_passed", "udp_total", "override")
+                if type(ipv6_report.get(key)) in {bool, int}}
+            checks = ipv6_report.get("checks")
+            if isinstance(checks, (dict, list, tuple)):
+                summary["ipv6_transport"]["checks"] = len(checks)
         summary["unverifiable"] = sum(item.unverifiable for item in results)
         # Traces that came back with the runner's own address: the node did not
         # carry them. Should be 0; anything else is a leak worth investigating.
