@@ -732,6 +732,9 @@ class SourceResult:
     landing: dict = field(default_factory=dict)
     #: Egress ASN class counts (cdn/datacenter/residential/mobile/unknown).
     asn_class: dict = field(default_factory=dict)
+    #: Roots the kernel delay probe rejected before curl. Visible so a too-tight
+    #: budget can be diagnosed per source instead of guessed from alive counts.
+    prefiltered: int = 0
 
 
 #: Upper bound on concurrent node dials. Each dial is one 1KB trace through the
@@ -1022,7 +1025,7 @@ class NativeProbe:
                     # production trace returns (ip, cc, http_version).
                     item = (item[0], item[1], "")
                 normalized.append((item, delays.get(index, 0)))
-            return normalized, not healthy
+            return normalized, not healthy, skipped
         except OSError:
             raise ProbeError("kernel_execution_failure") from None
         finally:
@@ -1118,16 +1121,19 @@ class NativeProbe:
                 private_write(Path(directory) / "config.yaml", canonical(config))
                 if len(accepted) != len(entries) and not self.validate(directory, config):
                     raise ProbeError("kernel_config_failure")
-                evidence, degraded = self._run_kernel(directory, list(zip(lanes, ports[:-1])), controller, secret, degrade_end=True)
+                evidence, degraded, skipped = self._run_kernel(directory, list(zip(lanes, ports[:-1])), controller, secret, degrade_end=True)
             else:
-                evidence, degraded = [], False
+                evidence, degraded, skipped = [], False, set()
         self.merged_groups += 1
         outcome = {(entry[0], entry[2]): evidence[index] for index, entry in enumerate(accepted)}
+        rejected = {(accepted[index][0], accepted[index][2]) for index in skipped}
         invalid_keys = {(job_index, root) for job_index, job, root in invalid}
         results = []
         for job_index, job in enumerate(jobs):
             invalid_count = sum(len(group) for group in plans[job_index]
                                 if (job_index, group[0]) in invalid_keys)
+            prefiltered = sum(len(group) for group in plans[job_index]
+                              if (job_index, group[0]) in rejected)
             measured = []
             for group in plans[job_index]:
                 value = outcome.get((job_index, group[0]))
@@ -1141,7 +1147,7 @@ class NativeProbe:
                 ip, cc, version = item
                 for root in group:
                     measured.append(Measurement(root, ip, cc, version, delay))
-            results.append((measured, invalid_count, unverifiable[job_index]))
+            results.append((measured, invalid_count, unverifiable[job_index], prefiltered))
         return results
 
     def measure_jobs(self, jobs, batch=0):
@@ -1160,7 +1166,7 @@ class NativeProbe:
         for chunk in chunks:
             if len(chunk) == 1:
                 job = jobs[chunk[0]]
-                outcomes[chunk[0]] = self(job.graph, job.roots)
+                outcomes[chunk[0]] = tuple(self(job.graph, job.roots)) + (0,)
                 continue
             try:
                 group = self._measure_group([jobs[index] for index in chunk])
@@ -1172,7 +1178,7 @@ class NativeProbe:
                 # contract matter more than the saved startup time.
                 for index in chunk:
                     job = jobs[index]
-                    outcomes[index] = self(job.graph, job.roots)
+                    outcomes[index] = tuple(self(job.graph, job.roots)) + (0,)
             else:
                 for index, value in zip(chunk, group):
                     outcomes[index] = value
@@ -1219,7 +1225,7 @@ class NativeProbe:
             # has genuinely never been tested.
             if len(accepted) != len(reps) and not self.validate(directory, cfg):
                 raise ProbeError("kernel_config_failure")
-            evidence, degraded = self._run_kernel(directory, list(zip(accepted, ports[:-1])), controller, secret)
+            evidence, degraded, _skipped = self._run_kernel(directory, list(zip(accepted, ports[:-1])), controller, secret)
         index_of = {root: index for index, root in enumerate(accepted)}
         invalid_set = set(invalid)
         invalid_count = sum(len(group) for group in measurable if group[0] in invalid_set)
@@ -1493,7 +1499,7 @@ def prepare_source(name, config, front, probe):
     return job
 
 
-def finish_source(job, measurements, invalid, unverifiable):
+def finish_source(job, measurements, invalid, unverifiable, prefiltered=0):
     """Turn a job's raw outcome into a SourceResult and its published body."""
     result = SourceResult(job.name, input=len(job.config.get("proxies", [])))
     result.uses_front = job.uses_front
@@ -1502,6 +1508,7 @@ def finish_source(job, measurements, invalid, unverifiable):
     result.v6_roots = list(job.v6_roots)
     result.invalid = invalid
     result.unverifiable = unverifiable
+    result.prefiltered = prefiltered
     result.measured = max(0, len(job.roots) - invalid - unverifiable)
     result.unique_egress = len({egress_key(item.ip) for item in measurements})
     # HTTP/1.1-only exits are kept (some clients and nodes are h1 only) but
@@ -1576,7 +1583,8 @@ def measure_all(sources, configs, front, probe):
                                                   ProbeError("kernel_execution_failure"))
                 continue
             try:
-                results[job.name] = finish_source(job, *outcome)
+                prefiltered = outcome[3] if len(outcome) > 3 else 0
+                results[job.name] = finish_source(job, *outcome[:3], prefiltered=prefiltered)
             except Exception as exc:
                 results[job.name] = failed_source(job.name, job.config, exc)
     else:
@@ -1973,6 +1981,7 @@ def plan_updates(results, old):
                 "delay_median_ms": result.delay_median_ms,
                 "delay_p90_ms": result.delay_p90_ms,
                 "landing": result.landing, "asn_class": result.asn_class,
+                "prefiltered": result.prefiltered,
             }
             continue
         if accept:
@@ -1989,6 +1998,7 @@ def plan_updates(results, old):
             "delay_median_ms": result.delay_median_ms,
             "delay_p90_ms": result.delay_p90_ms,
             "landing": result.landing, "asn_class": result.asn_class,
+            "prefiltered": result.prefiltered,
         }
     # Freeze names for the sources published this round, then for the merged
     # projection (which also covers retained artifacts rendered by an older
@@ -2017,7 +2027,7 @@ def plan_updates(results, old):
                 "measured": 0, "invalid": 0, "unverifiable": 0,
                 "bad_streak": 0, "unproven_rounds": 0, "uses_front": False,
                 "delay_median_ms": 0, "delay_p90_ms": 0,
-                "landing": {}, "asn_class": {},
+                "landing": {}, "asn_class": {}, "prefiltered": 0,
             }
     if not effective:
         # Nothing usable remains. Every source proven dead means the merged body
@@ -2189,7 +2199,8 @@ def result_reports(results, files=None):
                         "http1": item.http1, "uses_front": item.uses_front,
                         "delay_median_ms": item.delay_median_ms,
                         "delay_p90_ms": item.delay_p90_ms,
-                        "landing": item.landing, "asn_class": item.asn_class})
+                        "landing": item.landing, "asn_class": item.asn_class,
+                        "prefiltered": item.prefiltered})
     return reports
 
 

@@ -162,7 +162,9 @@ jobs:
           PROBE_V6_SSH_PORT: ${{ secrets.V6_HELPER_PORT }}
           PROBE_V6_SSH_USER: ${{ secrets.V6_HELPER_USER }}
           PROBE_V6_MIHOMO: /opt/probe-v6/bin/mihomo
-          PROBE_V6_WORKERS: '12'
+          # The helper now measures all v6 roots through one kernel, so the
+          # dial pool is the limit rather than 38 kernel starts.
+          PROBE_V6_WORKERS: '24'
         run: |
           set -euo pipefail
           umask 077

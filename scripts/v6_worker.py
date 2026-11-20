@@ -60,6 +60,7 @@ def main():
         job.get("timeout") or 15,
         ipv6=True,
     )
+    prepared = []
     for item in job.get("jobs") or []:
         if not isinstance(item, dict):
             continue
@@ -68,21 +69,38 @@ def main():
         out["results"].setdefault(source, {})
         out["judged"].setdefault(source, 0)
         try:
-            graph = probe.Graph(probe.dedupe_names(item.get("config") or {}))
-            measured, invalid, unverifiable = runner(graph, roots)
-            for item_measured in measured:
-                out["results"][source][item_measured.name] = {
-                    "alive": True,
-                    "ip": item_measured.ip,
-                    "cc": item_measured.cc,
-                }
-            # Roots the kernel refused or that stayed unverifiable were not
-            # judged; everything else was dialled and simply did not come back.
-            out["judged"][source] = max(0, len(roots) - invalid - unverifiable)
+            config = item.get("config") or {}
+            graph = probe.Graph(probe.dedupe_names(config))
         except probe.ProbeError as exc:
             out["errors"].append("%s:%s" % (source, probe.error_code(exc)))
+            continue
         except Exception as exc:  # noqa: BLE001 - never leak text, only the class
             out["errors"].append("%s:%s" % (source, type(exc).__name__))
+            continue
+        prepared.append(probe.SourceJob(source, config, graph, roots, set(), False))
+    # One kernel for every source's v6 roots instead of one per source: the
+    # fixed startup cost dominated the helper's wall time (38 starts for 314
+    # nodes). measure_jobs falls back per source if the shared kernel fails.
+    try:
+        outcomes = runner.measure_jobs(prepared) if prepared else []
+    except Exception as exc:  # noqa: BLE001
+        out["errors"].extend("%s:%s" % (item.name, type(exc).__name__) for item in prepared)
+        outcomes = []
+    for item, outcome in zip(prepared, outcomes):
+        source = item.name
+        if not outcome:
+            out["errors"].append("%s:probe_error" % source)
+            continue
+        measured, invalid, unverifiable = outcome[:3]
+        for item_measured in measured:
+            out["results"][source][item_measured.name] = {
+                "alive": True,
+                "ip": item_measured.ip,
+                "cc": item_measured.cc,
+            }
+        # Roots the kernel refused or that stayed unverifiable were not
+        # judged; everything else was dialled and simply did not come back.
+        out["judged"][source] = max(0, len(item.roots) - invalid - unverifiable)
     print(json.dumps(out, ensure_ascii=False))
     return 0
 

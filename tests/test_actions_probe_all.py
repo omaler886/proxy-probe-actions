@@ -1605,6 +1605,26 @@ class MergedKernelTests(unittest.TestCase):
             outcomes = probe.measure_jobs(jobs)
         self.assertEqual(calls, [["a"], ["b"]])
         self.assertEqual([len(outcome[0]) for outcome in outcomes], [1, 1])
+        self.assertEqual([outcome[3] for outcome in outcomes], [0, 0])
+
+    def test_prefiltered_nodes_are_counted_per_source(self):
+        jobs = [self._job("alpha", "a", "1.1.1.1"),
+                self._job("beta", "b", "2.2.2.2")]
+        probe = p.NativeProbe("mihomo", delay_ms=3000)
+        process = mock.Mock()
+        process.poll.return_value = None
+
+        def delay(controller, secret, name):
+            return (False, 0, False) if name.startswith("s1-") else (True, 50, False)
+
+        with mock.patch.object(probe, "validate", return_value=True), \
+             mock.patch.object(probe, "health", return_value=True), \
+             mock.patch.object(probe, "delay_probe", side_effect=delay), \
+             mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US", "2")), \
+             mock.patch.object(p.subprocess, "Popen", return_value=process):
+            outcomes = probe.measure_jobs(jobs)
+        self.assertEqual([len(outcome[0]) for outcome in outcomes], [1, 0])
+        self.assertEqual([outcome[3] for outcome in outcomes], [0, 1])
 
 
 class MeasureAllTests(unittest.TestCase):
