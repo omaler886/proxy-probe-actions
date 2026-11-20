@@ -145,11 +145,11 @@ jobs:
           # cannot lose the round. PROBE_KERNEL_BATCH>0 caps sources per kernel.
           PROBE_KERNEL_BATCH: '0'
           # Ask the kernel's own /proxies/<name>/delay endpoint before curl: a
-          # dead node costs 2s instead of a short trace plus a full retry, and
+          # dead node costs 3s instead of a short trace plus a full retry, and
           # the delay becomes an audit field. Survivors still get the curl trace
           # (exit IP, TLS verdict), so this never replaces the evidence.
           PROBE_DELAY_PREFILTER: '1'
-          PROBE_DELAY_TIMEOUT_MS: '2000'
+          PROBE_DELAY_TIMEOUT_MS: '3000'
           # Identical connection definitions inside one source share one dial;
           # the verdict is replicated to every duplicate label.
           PROBE_DEDUPE: '1'

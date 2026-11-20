@@ -960,7 +960,7 @@ class NativeProbe:
             return {}, set()
         delays, skipped = {}, set()
         # The controller answers these in parallel; 32 left dead nodes queuing
-        # (2s each) behind the pool. Use the round's dial concurrency as the
+        # (~3s each) behind the pool. Use the round's dial concurrency as the
         # ceiling so the prefilter cannot become the new bottleneck.
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(self.workers, 128))) as pool:
             outcomes = list(pool.map(lambda lane: self.delay_probe(controller, secret, lane[0]), lanes))
@@ -2346,10 +2346,10 @@ def run(env=None, transport=None, probe=None):
             probe = NativeProbe(
                 binary, env.get("PROBE_CONCURRENCY", 8), env.get("PROBE_TIMEOUT", 15),
                 ipv6=override,
-                # A dead node costs one 2s controller call instead of a short
+                # A dead node costs one 3s controller call instead of a short
                 # trace plus a full retry; survivors still get a curl trace for
                 # exit IP / TLS evidence, so the prefilter never replaces it.
-                delay_ms=(env_int(env.get("PROBE_DELAY_TIMEOUT_MS", 2000), 2000, 0, 30000)
+                delay_ms=(env_int(env.get("PROBE_DELAY_TIMEOUT_MS", 3000), 3000, 0, 30000)
                           if env_flag(env.get("PROBE_DELAY_PREFILTER"), True) else 0),
                 kernel_batch=env_int(env.get("PROBE_KERNEL_BATCH", 0), 0, 0, 100000),
                 dedupe=env_flag(env.get("PROBE_DEDUPE"), True),
