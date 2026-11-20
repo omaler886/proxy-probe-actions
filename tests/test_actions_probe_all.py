@@ -434,6 +434,19 @@ class NameFreezeTests(unittest.TestCase):
         kept = p.plan_updates([], files)
         self.assertEqual(json.loads(kept["manifest.json"])["names"], manifest["names"])
 
+    def test_migration_seeds_names_from_the_already_published_artifact(self):
+        files = p.plan_updates([self.render(["a", "b", "c"])], {})
+        first = self.names(files)
+        # The upgrade lands on a round where one sibling is already gone: the
+        # recomputed set would reuse "-2", but the published name must win.
+        manifest = json.loads(files["manifest.json"])
+        manifest.pop("names")
+        legacy = dict(files, **{"manifest.json": json.dumps(manifest)})
+        migrated = p.plan_updates([self.render(["a", "c"])], legacy)
+        second = self.names(migrated)
+        self.assertEqual(second["a.invalid"], first["a.invalid"])
+        self.assertEqual(second["c.invalid"], first["c.invalid"])
+
     def test_merged_names_are_frozen_across_sources(self):
         def result(source, name, server):
             graph = p.Graph({"proxies": [node(name, "ss", server)]})

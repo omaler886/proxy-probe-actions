@@ -1353,10 +1353,19 @@ def plan_updates(results, old):
             raise ValueError
     except (ValueError, TypeError):
         raise ProbeError("manifest_invalid") from None
-    # The persisted name table: fingerprint -> published name. Absent in older
-    # manifests, in which case names are allocated this round and stored.
+    # The persisted name table: scope -> {fingerprint: published name}. Absent
+    # in older manifests, which is the one moment names are seeded -- and they
+    # are seeded from what is ALREADY published, not from this round's
+    # recomputation: the migration round can coincide with a source being
+    # dropped, and renumbering the survivors then would defeat the freeze.
     names = load_name_table(old.get("manifest.json", ""))
+    migrating = not isinstance(old_manifest.get("names"), dict)
     name_keys = {}
+    if migrating:
+        published = {name: text for name, text in old.items() if SOURCE_FILE.fullmatch(name)}
+        published["merged"] = old.get("mihomo-alive.yaml", "")
+        _, seeded = freeze_names(published, names)
+        name_keys.update(seeded)
     # Deliberately retain remote sources absent from today's authoritative selection,
     # except artifacts that were produced by measuring our own published files
     # (a `gist-` source). Those are self-referential and must not survive a fix
