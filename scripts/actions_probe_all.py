@@ -2388,7 +2388,7 @@ def run(env=None, transport=None, probe=None):
                           if env_flag(env.get("PROBE_DELAY_PREFILTER"), True) else 0),
                 # A first-budget failure is retried once at this budget before
                 # the node is skipped, so only the genuinely dead are dropped.
-                delay_retry_ms=env_int(env.get("PROBE_DELAY_RETRY_MS", 8000), 8000, 0, 30000),
+                delay_retry_ms=env_int(env.get("PROBE_DELAY_RETRY_MS", 15000), 15000, 0, 30000),
                 kernel_batch=env_int(env.get("PROBE_KERNEL_BATCH", 0), 0, 0, 100000),
                 dedupe=env_flag(env.get("PROBE_DEDUPE"), True),
             )

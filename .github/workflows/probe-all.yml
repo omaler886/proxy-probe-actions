@@ -150,9 +150,10 @@ jobs:
           # (exit IP, TLS verdict), so this never replaces the evidence.
           PROBE_DELAY_PREFILTER: '1'
           PROBE_DELAY_TIMEOUT_MS: '3000'
-          # A first-budget miss is retried at 8s before curl is skipped: the
-          # slow-but-alive tail must never be dropped by a single short budget.
-          PROBE_DELAY_RETRY_MS: '8000'
+          # A first-budget miss is retried at the SAME 15s budget as curl's final
+          # pass: the prefilter must never be stricter than the measurement it
+          # replaces, or the slow-but-alive tail is silently dropped.
+          PROBE_DELAY_RETRY_MS: '15000'
           # Identical connection definitions inside one source share one dial;
           # the verdict is replicated to every duplicate label.
           PROBE_DEDUPE: '1'
