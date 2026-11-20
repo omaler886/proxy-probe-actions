@@ -3,7 +3,9 @@
 
 Run: SUBSTORE_BASE=... MIHOMO_BIN=/path/mihomo PROBE_OUTPUT_DIR=/private/path
      python scripts/actions_probe_all.py
-Optional: GIST_TOKEN + GIST_ID (or GITHUB_GIST_ID), PROBE_CONCURRENCY=8,
+Optional: PROBE_STATE_REPO + PROBE_STATE_TOKEN for authenticated policy state;
+GIST_TOKEN + GIST_ID deliver the merged result only and require private state.
+Other options: PROBE_CONCURRENCY=8 (workflow ceiling=64),
 PROBE_TIMEOUT=15, PROBE_FRONT_SUB=cf-front, PROBE_SOURCES_JSON='["source"]'.
 When PROBE_SOURCES_JSON is unset, every selected source is tested every round.
 Per-source credentials: SOURCE_SECRETS_JSON (an Actions Secret holding a JSON
@@ -45,6 +47,8 @@ import yaml
 # in isolation (offline) and replaced without touching the probe contract.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import geo_naming  # noqa: E402
+from publication import DeliveryGist, PrivateStateStore, PublicationError  # noqa: E402
+from probe_limits import EndpointLimiter, choose_workers, interleave_endpoints  # noqa: E402
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -62,10 +66,13 @@ class ProbeError(Exception):
 
 
 ERROR_CODES = set("trace_invalid github_redirect response_large upstream_redirect transport_failure redirect_limit base_invalid sources_invalid source_secrets_invalid subscription_invalid definition_invalid definition_duplicate definition_collision dependency_invalid dependency_cycle_or_direct dependency_missing kernel_validation_failure kernel_config_failure kernel_start_failure kernel_end_failure kernel_execution_failure old_content_invalid namespace_collision manifest_invalid gist_id_invalid gist_token_invalid gist_not_private gist_raw_invalid environment_missing kernel_missing curl_missing sources_empty sources_filter_invalid sources_filter_missing no_successful_roots gist_conflict http_failure request_invalid non_proxy_outbound dependency_group_unsupported".split())
+ERROR_CODES.add("helper_config_invalid")
 
 
 def error_code(exc):
     # NEVER return arbitrary exception text: parsers/urllib can include secrets.
+    if isinstance(exc, PublicationError):
+        return str(exc) if re.fullmatch(r"(?:state|delivery|publication)_[a-z_]+", str(exc)) else "publication_error"
     if isinstance(exc, ProbeError):
         code = exc.args[0] if exc.args else ""
         return code if isinstance(code, str) and (code in ERROR_CODES or re.fullmatch(r"http_[1-5][0-9]{2}", code)) else "probe_error"
@@ -380,9 +387,7 @@ def load_source_secrets(env):
         if url is not None:
             if not isinstance(url, str):
                 raise ProbeError("source_secrets_invalid")
-            parts = urllib.parse.urlsplit(url)
-            if parts.scheme not in ("http", "https") or not parts.hostname or parts.username:
-                raise ProbeError("source_secrets_invalid")
+            require_https(url, "source_secrets_invalid")
             entry["url"] = url
         if not entry:
             raise ProbeError("source_secrets_invalid")
@@ -390,10 +395,23 @@ def load_source_secrets(env):
     return parsed
 
 
+def require_https(url, category):
+    """Validate a credential-bearing URL; return parsed parts or a fixed error."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if (parts.scheme != "https" or not parts.hostname or parts.username is not None
+                or parts.fragment or parts.port == 0
+                or any(character.isspace() or ord(character) < 32 for character in url)):
+            raise ValueError
+        return parts
+    except (ValueError, TypeError):
+        raise ProbeError(category) from None
+
+
 class SubStore:
     def __init__(self, base, transport, source_secrets=None):
-        parsed = urllib.parse.urlsplit(base)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.query or parsed.fragment:
+        parsed = require_https(base, "base_invalid")
+        if parsed.query:
             raise ProbeError("base_invalid")
         self.base, self.transport = base.rstrip("/"), transport
         # Per-source credentials are keyed by exact source name; a name without
@@ -418,6 +436,8 @@ class SubStore:
             # Full-URL override for a source hosted outside this Sub-Store. The
             # transport still applies its own redirect/size discipline.
             url = secret["url"]
+        # Callers can construct SubStore directly without load_source_secrets.
+        require_https(url, "source_secrets_invalid")
         if "query" in secret:
             parts = urllib.parse.urlsplit(url)
             merged = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
@@ -583,6 +603,27 @@ class Graph:
         """True when reaching this root requires an IPv6 literal address."""
         return any(is_v6_literal(server) for server in self.dial_servers(root))
 
+    def entry_host(self, root):
+        """Return the first physical dial host for a root's frozen dependency chain."""
+        current, visited = root, set()
+        while current not in visited:
+            visited.add(current)
+            if current in self.groups:
+                current = min(set(self.groups[current]["proxies"]),
+                              key=lambda name: (self.identity(name), name))
+                continue
+            node = self.nodes[current]
+            dependency = self.dependency(node)
+            if dependency:
+                current = dependency
+                continue
+            server = str(node.get("server", "")).strip().lower().rstrip(".")
+            try:
+                return str(ipaddress.ip_address(server))
+            except ValueError:
+                return server or self.identity(root)
+        raise ProbeError("dependency_cycle_or_direct")
+
     def front_backed(self, roots, front_only) -> bool:
         """True when any root's dial chain reaches a node supplied by the front.
 
@@ -677,6 +718,12 @@ def private_write(path, content):
             os.unlink(tmp)
 
 
+def child_environment():
+    """Return process essentials without Actions tokens, subscriptions or SSH agents."""
+    allowed = {"PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL"}
+    return {key: value for key, value in os.environ.items() if key in allowed}
+
+
 #: Returned by ``NativeProbe.trace`` when the response came from the runner
 #: itself. It is neither a measurement nor a failure worth retrying.
 DIRECT_LEAK = object()
@@ -766,9 +813,13 @@ class SourceJob:
 
 class NativeProbe:
     def __init__(self, binary, workers=8, timeout=15, transport=None, ipv6=None,
-                 delay_ms=0, delay_retry_ms=0, kernel_batch=0, dedupe=False):
+                 delay_ms=0, delay_retry_ms=0, kernel_batch=0, dedupe=False,
+                 adaptive=True, per_endpoint=8):
         self.binary = binary
         self.workers = max(1, min(MAX_WORKERS, int(workers)))
+        self.adaptive = bool(adaptive)
+        self.per_endpoint = max(1, min(self.workers, int(per_endpoint)))
+        self.workers_used = 0
         self.timeout = max(1, min(120, int(timeout)))
         #: Readiness polling must NOT reuse Transport. That opener retries a
         #: refused socket with a 1s/2s backoff, so a kernel that bound in 0.2s
@@ -809,7 +860,7 @@ class NativeProbe:
         path = Path(directory) / "config.yaml"
         private_write(path, canonical(cfg))
         try:
-            run = subprocess.run([self.binary, "-t", "-d", str(directory), "-f", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            run = subprocess.run([self.binary, "-t", "-d", str(directory), "-f", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, env=child_environment())
             return run.returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             raise ProbeError("kernel_validation_failure") from None
@@ -839,7 +890,8 @@ class NativeProbe:
                 "--max-filesize", "65536",
                 "--output", path, "--write-out", "%{http_version} %{ssl_verify_result} %{time_total}",
                 TRACE_URL,
-            ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=budget + 3)
+            ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=budget + 3,
+                env=child_environment())
             if run.returncode:
                 return None
             ok, version, elapsed_ms = self.negotiation(run.stdout)
@@ -875,7 +927,7 @@ class NativeProbe:
         except Exception:
             return False, "", 0
         if len(parts) < 2:
-            return True, "", 0
+            return False, "", 0
         try:
             verified = int(parts[1]) == 0
         except ValueError:
@@ -968,7 +1020,7 @@ class NativeProbe:
         except Exception:
             return (False, 0, True)
 
-    def _prefilter(self, lanes, controller, secret):
+    def _prefilter(self, lanes, controller, secret, endpoint_keys=None):
         """Two-stage delay pre-screen over every lane, aligned by index.
 
         A single short budget is measurably stricter than curl's 5s+15s trace:
@@ -984,19 +1036,24 @@ class NativeProbe:
         if not self.delay_ms:
             return {}, set()
         delays, skipped = {}, set()
-        pending = list(range(len(lanes)))
+        endpoint_keys = endpoint_keys or [lane[0] for lane in lanes]
+        pending = interleave_endpoints(list(range(len(lanes))), endpoint_keys)
+        limiter = EndpointLimiter(endpoint_keys, self.per_endpoint)
+        workers = choose_workers(len(lanes), min(self.workers, 128), endpoint_keys,
+                                 self.per_endpoint, self.adaptive)
         budgets = [self.delay_ms]
         if self.delay_retry_ms > self.delay_ms:
             budgets.append(self.delay_retry_ms)
         # The controller answers these in parallel; 32 left dead nodes queuing
         # (~3s each) behind the pool. Use the round's dial concurrency as the
         # ceiling so the prefilter cannot become the new bottleneck.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(self.workers, 128))) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             for budget in budgets:
                 if not pending:
                     break
                 outcomes = list(pool.map(
-                    lambda index: self.delay_probe(controller, secret, lanes[index][0], budget),
+                    lambda index: limiter.call(endpoint_keys[index], self.delay_probe,
+                                               controller, secret, lanes[index][0], budget),
                     pending,
                 ))
                 retry = []
@@ -1012,7 +1069,8 @@ class NativeProbe:
         self.prefiltered += len(skipped)
         return delays, skipped
 
-    def _run_kernel(self, directory, lanes, controller, secret, degrade_end=False):
+    def _run_kernel(self, directory, lanes, controller, secret, degrade_end=False,
+                    endpoint_keys=None):
         """Start one kernel over ``lanes`` and return evidence aligned with it.
 
         ``lanes`` is ``[(proxy_name, port)]``. Returns ``(evidence, degraded)``
@@ -1025,7 +1083,7 @@ class NativeProbe:
         """
         process = None
         try:
-            process = subprocess.Popen([self.binary, "-d", str(directory), "-f", str(directory / "config.yaml")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            process = subprocess.Popen([self.binary, "-d", str(directory), "-f", str(directory / "config.yaml")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_environment())
             deadline = time.monotonic() + 15
             while not self.health(process, controller, secret, once=True):
                 if process.poll() is not None or time.monotonic() > deadline:
@@ -1033,7 +1091,8 @@ class NativeProbe:
                 time.sleep(0.05)
             # Delay pre-screen BEFORE curl: the kernel answers in its own
             # socket, with no fork, no temp file, and one request per node.
-            delays, skipped = self._prefilter(lanes, controller, secret)
+            endpoint_keys = endpoint_keys or [lane[0] for lane in lanes]
+            delays, skipped = self._prefilter(lanes, controller, secret, endpoint_keys)
             # Two passes, not "the same attempt twice". Pass 1 gives every
             # node a short budget; nothing that needs longer than that for
             # 1KB is usable anyway. Only the failures spend the full budget
@@ -1041,13 +1100,25 @@ class NativeProbe:
             # dead node stops costing 2 x the full timeout.
             fast = max(3, min(6, self.timeout // 3))
             evidence = [None] * len(lanes)
-            active = [index for index in range(len(lanes)) if index not in skipped]
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
-                for index, item in zip(active, pool.map(lambda index: self.trace(lanes[index][1], directory, fast), active)):
+            active = interleave_endpoints(
+                [index for index in range(len(lanes)) if index not in skipped], endpoint_keys)
+            workers = choose_workers(len(active), self.workers,
+                                     [endpoint_keys[index] for index in active],
+                                     self.per_endpoint, self.adaptive)
+            self.workers_used = max(self.workers_used, workers)
+            limiter = EndpointLimiter(endpoint_keys, self.per_endpoint)
+
+            def trace_limited(index, budget=None):
+                """Dial a lane under its entry-host limit; return trace evidence."""
+                return limiter.call(endpoint_keys[index], self.trace,
+                                    lanes[index][1], directory, budget)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                for index, item in zip(active, pool.map(lambda index: trace_limited(index, fast), active)):
                     evidence[index] = item
                 retry = [index for index in active if evidence[index] is None]
                 if retry:
-                    for index, item in zip(retry, pool.map(lambda index: self.trace(lanes[index][1], directory), retry)):
+                    for index, item in zip(retry, pool.map(trace_limited, retry)):
                         evidence[index] = item
             healthy = self.health(process, controller, secret)
             if not healthy and not degrade_end:
@@ -1159,7 +1230,10 @@ class NativeProbe:
                 private_write(Path(directory) / "config.yaml", canonical(config))
                 if len(accepted) != len(entries) and not self.validate(directory, config):
                     raise ProbeError("kernel_config_failure")
-                evidence, degraded, skipped = self._run_kernel(directory, list(zip(lanes, ports[:-1])), controller, secret, degrade_end=True)
+                endpoint_keys = [job.graph.entry_host(root) for _, job, root in accepted]
+                evidence, degraded, skipped = self._run_kernel(
+                    directory, list(zip(lanes, ports[:-1])), controller, secret,
+                    degrade_end=True, endpoint_keys=endpoint_keys)
             else:
                 evidence, degraded, skipped = [], False, set()
         self.merged_groups += 1
@@ -1266,7 +1340,9 @@ class NativeProbe:
             # has genuinely never been tested.
             if len(accepted) != len(reps) and not self.validate(directory, cfg):
                 raise ProbeError("kernel_config_failure")
-            evidence, degraded, _skipped = self._run_kernel(directory, list(zip(accepted, ports[:-1])), controller, secret)
+            evidence, degraded, _skipped = self._run_kernel(
+                directory, list(zip(accepted, ports[:-1])), controller, secret,
+                endpoint_keys=[graph.entry_host(root) for root in accepted])
         index_of = {root: index for index, root in enumerate(accepted)}
         invalid_set = set(invalid)
         invalid_count = sum(len(group) for group in measurable if group[0] in invalid_set)
@@ -1420,7 +1496,8 @@ def _display_name(measurement):
 
 
 def _prefetch_geo(measurements):
-    geo_naming.prefetch([(item.ip, item.cc) for item in measurements])
+    """Enrich measurements locally; online providers run only in the cache tool."""
+    geo_naming.prefetch_offline([(item.ip, item.cc) for item in measurements])
 
 
 def _suffix(ip, width=3):
@@ -2138,8 +2215,11 @@ def manifest_state_changed(old_text, new_text) -> bool:
     return False
 
 
-class GistPublisher:
+class LegacyGistReader:
+    """Read old Gist state for an explicit migration; never write to that Gist."""
+
     def __init__(self, gist_id, token, transport):
+        """Validate migration credentials and retain the injected transport."""
         gist_id, token = gist_id.strip(), token.strip()
         if not token or any(ch.isspace() for ch in token):
             raise ProbeError("gist_token_invalid")
@@ -2150,6 +2230,7 @@ class GistPublisher:
         self.transport = transport
 
     def current(self):
+        """Read only managed legacy files and return them with the remote ETag."""
         raw, headers = self.transport("GET", self.url, self.headers)
         document = json.loads(raw)
         if document.get("public") is not False:
@@ -2169,22 +2250,35 @@ class GistPublisher:
                 files[name] = entry["content"]
         return files, headers.get("ETag", headers.get("Etag", headers.get("etag")))
 
+class StatePublisher:
+    """Apply the existing failure policy to an authenticated, versioned store."""
+
+    def __init__(self, store):
+        """Retain a store supporting current() and save(files, version)."""
+        self.store = store
+
     def publish(self, results):
+        """Replan on a bounded state conflict; return publication status and files."""
         for attempt in range(3):
             try:
                 return self._publish_once(results)
-            except ProbeError as exc:
-                if error_code(exc) not in {"http_412", "gist_conflict"} or attempt == 2:
+            except (ProbeError, PublicationError) as exc:
+                if error_code(exc) not in {"http_412", "state_conflict", "gist_conflict"} or attempt == 2:
                     raise
                 # Concurrent change: discard the old plan completely and read
                 # current private state again before constructing another PATCH.
         raise ProbeError("gist_conflict")
 
     def _publish_once(self, results):
-        old, _ = self.current()  # No PATCH at all if any read/parse/guard fails.
+        """Plan from current state, then commit it with the store's version guard."""
+        old, _ = self.store.current()
+        # A PUT can succeed while its response is lost. Replaying this same
+        # measurement must not advance grace counters for a second time.
+        round_id = getattr(self.store, "round_id", None)
+        if isinstance(round_id, str) and round_id in getattr(self.store, "applied_rounds", ()):
+            return "no_change", old
         files = plan_updates(results, old)
-        # A source whose nodes were all proven dead leaves the plan; its file
-        # is deleted on the same PATCH so its dead nodes cannot be pulled.
+        # Replace the whole bundle so policy deletions and the merged file agree.
         deletions = {name for name in old if SOURCE_FILE.fullmatch(name) and name not in files}
         if not any(SOURCE_FILE.fullmatch(name) for name in files) and not deletions:
             # A completely failed first run must not create an empty subscription.
@@ -2194,27 +2288,15 @@ class GistPublisher:
         # Counts/status alone must never produce standalone manifest revisions.
         yaml_updates = {name: {"content": text} for name, text in files.items()
                         if name != "manifest.json" and digest(text) != digest(old.get(name, ""))}
-        manifest_changed = digest(files["manifest.json"]) != digest(old.get("manifest.json", ""))
         state_changed = manifest_state_changed(old.get("manifest.json"), files["manifest.json"])
         if not yaml_updates and not deletions and not state_changed:
             return "no_change", files
-        updates = dict(yaml_updates)
-        # A file dropped from the plan (self-referential artifact cleanup, or a
-        # source whose nodes were all proven dead) is deleted on the same
-        # PATCH, so the stale subscription cannot be pulled.
-        updates.update({name: None for name in deletions})
-        if manifest_changed and (yaml_updates or deletions or state_changed):
-            updates["manifest.json"] = {"content": files["manifest.json"]}
-        # GitHub Gist PATCH rejects If-Match (HTTP 400): no atomic CAS exists
-        # for this endpoint. Serialize our writer in Actions. Re-read managed
-        # content immediately before PATCH and re-plan on a detected change;
-        # this narrows, but cannot eliminate, the cross-writer race window.
-        # Unrelated files are excluded from both comparison and PATCH payload.
-        latest, _ = self.current()
+        latest, latest_version = self.store.current()
         if latest != old:
-            raise ProbeError("gist_conflict")
-        headers = dict(self.headers, **{"Content-Type": "application/json"})
-        self.transport("PATCH", self.url, headers, json_text({"files": updates}).encode())
+            raise PublicationError("state_conflict")
+        # The private-repository store uses a blob SHA on PUT, which also
+        # closes the race between this final check and the server-side write.
+        self.store.save(files, latest_version)
         return "published", files
 
 
@@ -2247,16 +2329,29 @@ def result_reports(results, files=None):
 
 
 def _ssh_target(env):
-    """``user@host`` for the helper, defaulting the user to root.
-
-    A runner's own account is not root, so the helper's user must be explicit
-    or the key is offered to the wrong account and the auth fails.
-    """
+    """Return an explicit non-root helper account; reject option-like hosts."""
     host = str(env["PROBE_V6_HELPER"]).strip()
-    if "@" in host:
-        return host
-    user = str(env.get("PROBE_V6_SSH_USER", "root")).strip() or "root"
+    user = str(env.get("PROBE_V6_SSH_USER", "")).strip()
+    if (not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user) or user == "root"
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.:-]*", host)):
+        raise ProbeError("helper_config_invalid")
     return user + "@" + host
+
+
+def validate_helper(env):
+    """Require pinned SSH identity, host key and a valid non-root destination."""
+    target = _ssh_target(env)
+    try:
+        port = int(env.get("PROBE_V6_SSH_PORT", ""))
+    except (TypeError, ValueError):
+        raise ProbeError("helper_config_invalid") from None
+    if not 1 <= port <= 65535:
+        raise ProbeError("helper_config_invalid")
+    for setting in ("PROBE_V6_SSH_KEY", "PROBE_V6_SSH_KNOWN_HOSTS"):
+        path = Path(str(env.get(setting, "")))
+        if not path.is_file() or not path.stat().st_size:
+            raise ProbeError("helper_config_invalid")
+    return target
 
 
 def v6_bound_roots(config, front=None):
@@ -2277,6 +2372,22 @@ def v6_bound_roots(config, front=None):
     return roots
 
 
+def build_v6_job(source, config, front=None):
+    """Export only valid IPv6 roots and their complete dependencies for the helper."""
+    normalized = dedupe_names(config)
+    graph = Graph(normalized, front)
+    roots = []
+    for root in v6_bound_roots(normalized, front):
+        try:
+            graph.closure([root])
+        except ProbeError:
+            continue  # Invalid roots remain unjudged; do not ship other credentials.
+        roots.append(root)
+    if not roots:
+        return None
+    return {"source": source, "config": graph.export(roots), "roots": roots}
+
+
 def request_v6(jobs, env):
     """Ship one job list to the IPv6 helper and return ``(report, answer)``.
 
@@ -2289,44 +2400,42 @@ def request_v6(jobs, env):
     if not jobs:
         report["ok"] = True
         return report, None
-    payload = {"mihomo": env.get("PROBE_V6_MIHOMO", "/opt/probe-v6/bin/mihomo"),
-               "timeout": int(env.get("PROBE_TIMEOUT", 15)),
-               "workers": int(env.get("PROBE_V6_WORKERS", 4)),
+    try:
+        target = validate_helper(env)
+    except ProbeError:
+        report["error"] = "helper_config_invalid"
+        return report, None
+    payload = {"timeout": env_int(env.get("PROBE_TIMEOUT"), 15, 1, 120),
+               "workers": env_int(env.get("PROBE_V6_WORKERS"), 48, 1, 64),
+               "per_endpoint": env_int(env.get("PROBE_PER_ENDPOINT_CONCURRENCY"), 8, 1, 64),
                "jobs": jobs}
-    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    command = ["ssh", "-F", os.devnull, "-T", "-o", "BatchMode=yes",
+               "-o", "ConnectTimeout=10", "-o", "IdentityAgent=none",
+               "-o", "ClearAllForwardings=yes", "-o", "ForwardAgent=no"]
     # Pin the algorithms. A hardened helper may offer a post-quantum KEX that
     # some clients refuse outright, which shows up as a handshake failure
     # rather than an auth problem.
     command += ["-o", "KexAlgorithms=ecdh-sha2-nistp256,curve25519-sha256",
                 "-o", "HostKeyAlgorithms=ssh-ed25519,rsa-sha2-512,rsa-sha2-256",
                 "-o", "PubkeyAcceptedAlgorithms=ssh-ed25519"]
-    key = env.get("PROBE_V6_SSH_KEY", "").strip()
-    if key:
-        # The helper is a pinned host: the key file is a secret and the host
-        # key is checked against a known_hosts the runner materialises.
-        command += ["-i", key, "-o", "IdentitiesOnly=yes"]
-    known = env.get("PROBE_V6_SSH_KNOWN_HOSTS", "").strip()
-    if known:
-        command += ["-o", "UserKnownHostsFile=" + known, "-o", "StrictHostKeyChecking=yes"]
-    else:
-        command += ["-o", "StrictHostKeyChecking=accept-new"]
+    key = env["PROBE_V6_SSH_KEY"].strip()
+    known = env["PROBE_V6_SSH_KNOWN_HOSTS"].strip()
+    command += ["-i", key, "-o", "IdentitiesOnly=yes", "-o",
+                "UserKnownHostsFile=" + known, "-o", "StrictHostKeyChecking=yes",
+                "-o", "GlobalKnownHostsFile=" + os.devnull]
     command += ["-p", str(env["PROBE_V6_SSH_PORT"]),
-               _ssh_target(env),
+               target,
                "python3 /opt/probe-v6/scripts/v6_worker.py"]
     try:
         run = subprocess.run(command, input=json_text(payload).encode(),
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             timeout=int(env.get("PROBE_V6_TIMEOUT", 900)))
+                             timeout=env_int(env.get("PROBE_V6_TIMEOUT"), 900, 10, 1800),
+                             env=child_environment())
     except (OSError, subprocess.SubprocessError):
         report["error"] = "helper_unreachable"
         return report, None
     if run.returncode != 0:
         report["error"] = "helper_failed"
-        # The ssh client explains itself on stderr (refused, host key, kex).
-        # Keep the first line only: it names a host or an option, never a key.
-        first = run.stderr.decode("utf-8", "replace").strip().splitlines()
-        if first:
-            report["detail"] = first[0][:120]
         report["rc"] = run.returncode
         return report, None
     try:
@@ -2337,7 +2446,7 @@ def request_v6(jobs, env):
     return report, answer
 
 
-def apply_v6(results, answer, configs, report):
+def apply_v6(results, answer, configs, report, front=None):
     """Merge the helper's verdicts into this round and rebuild affected files.
 
     ``promoted`` is the number of measurements the helper actually added -- not
@@ -2358,7 +2467,7 @@ def apply_v6(results, answer, configs, report):
         # geolocation prefetch for nothing.
         if result.v6_roots and result.measurements:
             try:
-                graph = Graph(dedupe_names(configs[result.name]))
+                graph = Graph(dedupe_names(configs[result.name]), front)
                 result.content, result.published = source_output(
                     result.name, graph, result.measurements)
             except Exception:
@@ -2368,10 +2477,58 @@ def apply_v6(results, answer, configs, report):
     report["ok"] = True
     report["judged"] = sum(int(v or 0) for v in (answer.get("judged") or {}).values())
     report["promoted"] = max(0, promoted)
-    for message in answer.get("errors") or []:
-        if isinstance(message, str):
-            report.setdefault("helper_errors", []).append(message[:60])
+    report["helper_error_count"] = len(answer.get("errors") or [])
     return report
+
+
+def publication_backends(env, transport):
+    """Build and preflight private state and optional single-file Gist delivery."""
+    has_delivery = bool(env.get("GIST_TOKEN") or env.get("GIST_ID"))
+    has_state = bool(env.get("PROBE_STATE_REPO") or env.get("PROBE_STATE_TOKEN"))
+    if has_delivery and not has_state:
+        raise PublicationError("state_config_missing")
+    if not has_state:
+        return None, None
+    state = PrivateStateStore(
+        env.get("PROBE_STATE_REPO", ""), env.get("PROBE_STATE_TOKEN", ""), transport,
+        branch=env.get("PROBE_STATE_BRANCH", "main"),
+        path=env.get("PROBE_STATE_PATH", "probe/state.json"))
+    state.current()
+    delivery = None
+    if has_delivery:
+        delivery = DeliveryGist(env.get("GIST_ID", ""), env.get("GIST_TOKEN", ""), transport)
+        delivery.current()
+    return state, delivery
+
+
+def delivery_content(text):
+    """Return connection-only merged YAML, excluding source namespaces and metadata."""
+    document = yaml.safe_load(text)
+    graph = Graph(document)
+    roots = [node["name"] for node in document.get("proxies", [])]
+    names = {name: ("dependency-" + graph.identity(name)[:20]
+                    if name.startswith("__front-") else name) for name in graph.nodes}
+    names.update({name: "route-" + graph.identity(name)[:20] for name in graph.groups})
+    exported = graph.export(roots, names)
+    metadata = {"benchmark", "latency", "delay", "source", "source-name",
+                "subscription", "subscription-url", "description"}
+    for node in exported["proxies"]:
+        for key in list(node):
+            if key.startswith("_") or key in metadata:
+                node.pop(key)
+    # Sources can carry separate namespaces for an identical front. Removing
+    # their source namespace must also collapse the resulting identical names.
+    for field in ("proxies", "proxy-groups"):
+        if field not in exported:
+            continue
+        unique = {}
+        for item in exported[field]:
+            prior = unique.get(item["name"])
+            if prior is not None and prior != item:
+                raise PublicationError("delivery_dependency_collision")
+            unique[item["name"]] = item
+        exported[field] = list(unique.values())
+    return canonical(exported)
 
 
 def run(env=None, transport=None, probe=None):
@@ -2390,6 +2547,8 @@ def run(env=None, transport=None, probe=None):
         transport = transport or Transport()
         store = SubStore(base, transport, source_secrets=load_source_secrets(env))
         output = private_dir(env["PROBE_OUTPUT_DIR"])
+        summary["phase"] = "publication_preflight"
+        state_store, delivery = publication_backends(env, transport)
         if probe is None:
             binary = env.get("MIHOMO_BIN", "").strip()
             if not binary or not shutil.which(binary):
@@ -2409,6 +2568,8 @@ def run(env=None, transport=None, probe=None):
                 delay_retry_ms=env_int(env.get("PROBE_DELAY_RETRY_MS", 15000), 15000, 0, 30000),
                 kernel_batch=env_int(env.get("PROBE_KERNEL_BATCH", 0), 0, 0, 100000),
                 dedupe=env_flag(env.get("PROBE_DEDUPE"), True),
+                adaptive=env_flag(env.get("PROBE_ADAPTIVE_CONCURRENCY"), True),
+                per_endpoint=env_int(env.get("PROBE_PER_ENDPOINT_CONCURRENCY"), 8, 1, 256),
             )
         summary["phase"] = "sources"
         sources = store.sources()
@@ -2471,9 +2632,16 @@ def run(env=None, transport=None, probe=None):
         if (getattr(probe, "ipv6", True) is False
                 and env.get("PROBE_V6_HELPER", "").strip()
                 and env.get("PROBE_V6_SSH_PORT")):
-            v6_map = {name: v6_bound_roots(configs[name], front) for name in sources if name in configs}
-            helper_jobs = [{"source": name, "config": configs[name], "roots": v6_map[name]}
-                           for name in sources if name in configs and v6_map[name]]
+            helper_jobs = []
+            for name in sources:
+                if name not in configs:
+                    continue
+                try:
+                    helper_job = build_v6_job(name, configs[name], front)
+                except ProbeError:
+                    helper_job = None
+                if helper_job:
+                    helper_jobs.append(helper_job)
             if helper_jobs:
                 helper_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 helper_started = time.monotonic()
@@ -2504,7 +2672,7 @@ def run(env=None, transport=None, probe=None):
             summary["timings"]["helper_wait_s"] = round(time.monotonic() - mark, 1)
             summary["v6_helper"] = report
             if answer is not None:
-                apply_v6(results, answer, configs, report)
+                apply_v6(results, answer, configs, report, front)
             # helper_s is the helper's own wall time, not extra wall time: it
             # overlaps measure_s by design, so the phases no longer sum to
             # total_s. helper_wait_s is what the runner actually blocked on.
@@ -2513,6 +2681,7 @@ def run(env=None, transport=None, probe=None):
         # Geolocation runs inside source_output's prefetch (runner round and
         # helper rebuild alike); the resolver accumulates its own wall time.
         summary["timings"]["geo_s"] = round(geo_naming.PREFETCH_SECONDS, 1)
+        summary["asn_db"] = geo_naming.asn_db_status()
         front_result = next((item for item in results if item.name == front_name), None)
         if front_result is not None:
             front_alive = bool(not front_result.failed and front_result.alive > 0)
@@ -2532,6 +2701,8 @@ def run(env=None, transport=None, probe=None):
         summary["dedup_saved"] = getattr(probe, "dedup_saved", 0)
         summary["prefiltered"] = getattr(probe, "prefiltered", 0)
         summary["merged_kernels"] = getattr(probe, "merged_groups", 0)
+        summary["dial_workers"] = getattr(probe, "workers_used", 0)
+        summary["per_entry_limit"] = getattr(probe, "per_endpoint", 0)
         if requested:
             summary["results"] = result_reports(results)
         summary["phase"] = "checkpoint"
@@ -2546,10 +2717,15 @@ def run(env=None, transport=None, probe=None):
             raise ProbeError("no_successful_roots")
         summary["phase"] = "publish"
         mark = time.monotonic()
-        if env.get("GIST_TOKEN"):
-            gist_id = env.get("GIST_ID", env.get("GITHUB_GIST_ID", ""))
-            status, files = GistPublisher(gist_id, env["GIST_TOKEN"], transport).publish(results)
+        if state_store is not None:
+            status, files = StatePublisher(state_store).publish(results)
             summary["publication"] = status
+            summary["state_publication"] = status
+            if delivery is not None:
+                summary["publication"] = "pending_delivery"
+                summary["delivery"] = delivery.publish(delivery_content(files["mihomo-alive.yaml"]))
+                summary["publication"] = ("published" if "published" in {status, summary["delivery"]}
+                                          else "no_change")
         else:
             files = plan_updates(results, read_local(output))
             summary["publication"] = "local_only"

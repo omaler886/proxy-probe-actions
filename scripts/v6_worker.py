@@ -12,7 +12,7 @@ trace contract on a host with a real global IPv6 route, so those nodes get a
 real verdict instead of being dropped.
 
 Job (STDIN):
-  {"timeout": 15, "workers": 4, "mihomo": "/usr/local/bin/mihomo",
+  {"timeout": 15, "workers": 48, "per_endpoint": 8,
    "jobs": [{"source": "fe", "config": {...}, "roots": ["name", ...]}]}
 
 Result (STDOUT):
@@ -34,11 +34,22 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 import actions_probe_all as probe  # noqa: E402
 
+MIHOMO_BINARY = "/opt/probe-v6/bin/mihomo"
+MAX_JOB_BYTES = 8 * 1024 * 1024
+
 
 def main():
+    """Read a bounded SSH job as a dedicated user and emit sanitized verdicts."""
+    if not hasattr(os, "geteuid") or os.geteuid() == 0:
+        print(json.dumps({"host_ipv6": False, "results": {}, "judged": {},
+                          "errors": ["helper_user_invalid"]}))
+        return 2
     try:
-        job = json.load(sys.stdin)
-    except ValueError:
+        payload = sys.stdin.buffer.read(MAX_JOB_BYTES + 1)
+        if len(payload) > MAX_JOB_BYTES:
+            raise ValueError
+        job = json.loads(payload)
+    except (ValueError, UnicodeError):
         print(json.dumps({"host_ipv6": False, "results": {}, "judged": {},
                           "errors": ["job_invalid"]}))
         return 2
@@ -55,11 +66,15 @@ def main():
         return 0
 
     runner = probe.NativeProbe(
-        job.get("mihomo") or "/usr/local/bin/mihomo",
-        job.get("workers") or 4,
-        job.get("timeout") or 15,
+        MIHOMO_BINARY,
+        probe.env_int(job.get("workers"), 48, 1, 64),
+        probe.env_int(job.get("timeout"), 15, 1, 120),
         ipv6=True,
+        adaptive=True,
+        per_endpoint=probe.env_int(job.get("per_endpoint"), 8, 1, 64),
+        dedupe=True,
     )
+    runner.baseline_ip = probe.runner_exit_ip(probe.Transport())
     prepared = []
     for item in job.get("jobs") or []:
         if not isinstance(item, dict):

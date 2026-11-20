@@ -14,9 +14,10 @@
    同样被排除）。
 3. 结束。下一轮测活（cron `23 */6 * * *` 或手动 dispatch）会自动发现并测它：
    源列表来自 `GET /api/subs` 的实时读取，代码不需要知道任何一个源的存在。
-4. 测活发布后，想要按源订阅就在 Sub-Store 里加一个指向
-   `gist raw source-<sha256(源名)>.yaml` 的 sub（文件名是源名的 sha256，
-   不含源名本身）。
+4. 测活后，每源文件保存在私有状态仓库的 JSON bundle 中，读取需要认证。
+   Gist 只发布合并的 `mihomo-alive.yaml`。按源导入需要能认证的适配服务或
+   本地文件，不能再给 Sub-Store 添加匿名的 `source-*.yaml` Gist URL。
+   已有部署参见 [安全迁移说明](SECURITY_MIGRATION.md)。
 
 ## 情况 B：需要独立凭据的源 — 只改一个 Secret 的值
 
@@ -41,7 +42,7 @@
 |---|---|---|
 | `header` | 拉取该源时附加的 HTTP 头 | 拉源列表不受影响，只作用于该源的 `/download/` 请求 |
 | `query` | 追加/覆盖 URL 查询参数 | 与 `?target=ClashMeta` 合并，同名参数以此处为准 |
-| `url` | 整条 URL 覆盖（源不在本 Sub-Store 时用） | 必须 http(s)、不带 userinfo；重定向/大小限制照常生效 |
+| `url` | 整条 URL 覆盖（源不在本 Sub-Store 时用） | 必须 HTTPS、不带 userinfo 或 fragment；重定向/大小限制照常生效 |
 
 三个字段都可选，但每条至少要有一项；未知字段、形状不对、JSON 坏了都会以
 固定错误码 `source_secrets_invalid` 失败——**凭据片段永远不会进日志**（日志
@@ -64,8 +65,9 @@
 
 - secret 值绝不写进本仓库、issue、日志或聊天记录；GitHub 对 Actions 日志里的
   secret 做精确匹配打码，但不要依赖它做变换（URL 编码/截断都会绕过打码）。
-- `SOURCE_SECRETS_JSON` 只经环境变量进入脚本内存，不落 runner 磁盘、不进
-  artifact（本仓库本来就没有 artifact 上传）、不进 Gist。
+- `SOURCE_SECRETS_JSON` 本身只经环境变量进入主脚本内存，不传给 mihomo/curl/SSH
+  子进程环境，不进 artifact 或 Gist。拉取结果中的节点连接凭据仍会出现在
+  私有临时配置、私有状态及合并订阅中，连接所需的凭据不能靠脱敏去掉。
 - 若某个源的凭据泄露：直接更新 secret 值（轮换），旧值即刻失效于本管线。
 
 ## 代码挂载点（评审用）

@@ -29,6 +29,29 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check PyYAML==6.0.3
           python -m unittest discover -s tests -v
+      - name: Verify private state and isolated Gist delivery
+        env:
+          PROBE_STATE_REPO: ${{ secrets.PROBE_STATE_REPO }}
+          PROBE_STATE_TOKEN: ${{ secrets.PROBE_STATE_TOKEN }}
+          PROBE_STATE_BRANCH: ${{ vars.PROBE_STATE_BRANCH || 'main' }}
+          PROBE_STATE_PATH: ${{ vars.PROBE_STATE_PATH || 'probe/state.json' }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scripts')
+          from actions_probe_all import publication_backends, Transport, error_code
+          try:
+              state, delivery = publication_backends(dict(os.environ), Transport())
+              if state is None or delivery is None:
+                  raise ValueError('missing publication backend')
+              print('publication_preflight_ok=true')
+          except Exception as error:
+              print('publication_preflight_error=' + error_code(error))
+              raise SystemExit(2)
+          PY
       - name: Report host IPv6 capability
         run: |
           set -euo pipefail
@@ -56,6 +79,9 @@ jobs:
           chmod 700 "$RUNNER_TEMP/bin/mihomo"
           "$RUNNER_TEMP/bin/mihomo" -v
       - name: Fetch local ASN database
+        # Naming must not prevent a completed measurement when DB-IP is down.
+        continue-on-error: true
+        timeout-minutes: 3
         shell: bash
         run: |
           set -euo pipefail
@@ -65,10 +91,10 @@ jobs:
           month="$(date -u +%Y-%m)"
           url="https://download.db-ip.com/free/dbip-asn-lite-${month}.csv.gz"
           mkdir -p "$RUNNER_TEMP/asndb"
-          if ! curl --fail --silent --show-error --location --retry 3 --max-time 300 \
+          if ! curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --retry 1 --max-time 45 \
                  "$url" -o "$RUNNER_TEMP/asndb/asn.csv.gz"; then
             prev="$(date -u -d '1 month ago' +%Y-%m)"
-            curl --fail --silent --show-error --location --retry 3 --max-time 300 \
+            curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --retry 1 --max-time 45 \
               "https://download.db-ip.com/free/dbip-asn-lite-${prev}.csv.gz" \
               -o "$RUNNER_TEMP/asndb/asn.csv.gz"
           fi
@@ -81,36 +107,19 @@ jobs:
           test "$(head -n 1 "$RUNNER_TEMP/asndb/asn.csv" | awk -F, '{print NF}')" -ge 4
           # Feed the plain CSV to the resolver (also avoids re-gzip on each run).
           echo "PROBE_ASN_CSV=$RUNNER_TEMP/asndb/asn.csv" >> "$GITHUB_ENV"
-      - name: Verify Gist read access before spending measurement time
-        env:
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GIST_ID: ${{ secrets.GIST_ID }}
-        run: |
-          python - <<'PY'
-          import os, json, urllib.request, urllib.error
-          token = os.environ['GIST_TOKEN'].strip()
-          gist_id = os.environ['GIST_ID'].strip()
-          request = urllib.request.Request('https://api.github.com/gists/' + gist_id, headers={'Authorization': 'Bearer ' + token, 'User-Agent': 'probe-preflight', 'Accept': 'application/vnd.github+json'})
-          try:
-              with urllib.request.urlopen(request, timeout=30) as response:
-                  data = json.load(response)
-              assert data.get('public') is False
-              print('gist_read_ok=true')
-          except urllib.error.HTTPError as exc:
-              print('gist_preflight_http=' + str(exc.code))
-              raise SystemExit(2)
-          except Exception as exc:
-              print('gist_preflight_error=' + type(exc).__name__)
-              raise SystemExit(2)
-          PY
       - name: Materialize the IPv6 helper credentials
         shell: bash
         env:
           V6_HELPER_KEY: ${{ secrets.V6_HELPER_KEY }}
           V6_HELPER_KNOWN_HOSTS: ${{ secrets.V6_HELPER_KNOWN_HOSTS }}
+          V6_HELPER_HOST: ${{ secrets.V6_HELPER_HOST }}
         run: |
           set -euo pipefail
           umask 077
+          # The helper is optional; an IPv4-only run must not need an SSH key.
+          if [ -z "$V6_HELPER_HOST" ]; then
+            exit 0
+          fi
           test -n "$V6_HELPER_KEY"
           test -n "$V6_HELPER_KNOWN_HOSTS"
           mkdir -p "$RUNNER_TEMP/v6"
@@ -120,13 +129,17 @@ jobs:
           chmod 600 "$RUNNER_TEMP/v6/known_hosts"
           echo "PROBE_V6_SSH_KEY=$RUNNER_TEMP/v6/id_ed25519" >> "$GITHUB_ENV"
           echo "PROBE_V6_SSH_KNOWN_HOSTS=$RUNNER_TEMP/v6/known_hosts" >> "$GITHUB_ENV"
-      - name: Measure all original sources and publish Gist
+      - name: Measure, commit private state and deliver merged subscription
         env:
           SUBSTORE_BASE: ${{ secrets.SUBSTORE_BASE }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           # Gist id 也是定位器：secret gist 只要拿到 URL 就能匿名读全文，
           # 所以它和 token 一样只从 secret 注入，绝不写在仓库里。
           GIST_ID: ${{ secrets.GIST_ID }}
+          PROBE_STATE_REPO: ${{ secrets.PROBE_STATE_REPO }}
+          PROBE_STATE_TOKEN: ${{ secrets.PROBE_STATE_TOKEN }}
+          PROBE_STATE_BRANCH: ${{ vars.PROBE_STATE_BRANCH || 'main' }}
+          PROBE_STATE_PATH: ${{ vars.PROBE_STATE_PATH || 'probe/state.json' }}
           # 新增需要独立凭据的订阅源时的预留位（详见 docs/ADDING_SOURCES.md）：
           # 一个 secret 装下所有「源名 -> 凭据」的 JSON map，以后加源只改这个
           # secret 的值，workflow 和代码都不用动。未设置时为空串=无行为变化。
@@ -138,8 +151,12 @@ jobs:
           # the 4-core runner idle: a 1355-node round spent 441s, ~96% of it
           # dead nodes waiting out a timeout. Each node now gets a short first
           # pass and only failures pay the full PROBE_TIMEOUT in a second pass.
-          PROBE_CONCURRENCY: '64'
-          PROBE_GEO_LOOKUP: '1'
+          # This is a ceiling, not a fixed pool size. No automatic increase.
+          PROBE_CONCURRENCY: ${{ vars.PROBE_CONCURRENCY || '64' }}
+          PROBE_ADAPTIVE_CONCURRENCY: '1'
+          PROBE_PER_ENDPOINT_CONCURRENCY: ${{ vars.PROBE_PER_ENDPOINT_CONCURRENCY || '8' }}
+          # Measurement uses offline ASN/cache only; no per-exit HTTP calls.
+          PROBE_GEO_LOOKUP: '0'
           # One shared kernel for the whole round (38 starts -> 1). A merged
           # group that fails is retried one kernel per source, so a bad config
           # cannot lose the round. PROBE_KERNEL_BATCH>0 caps sources per kernel.
@@ -166,8 +183,7 @@ jobs:
           # stays the only writer of the Gist.
           PROBE_V6_HELPER: ${{ secrets.V6_HELPER_HOST }}
           PROBE_V6_SSH_PORT: ${{ secrets.V6_HELPER_PORT }}
-          PROBE_V6_SSH_USER: ${{ secrets.V6_HELPER_USER }}
-          PROBE_V6_MIHOMO: /opt/probe-v6/bin/mihomo
+          PROBE_V6_SSH_USER: ${{ secrets.V6_HELPER_USER || 'probe-v6' }}
           # The helper now measures all v6 roots through one kernel, so the
           # dial pool is the limit rather than 38 kernel starts.
           PROBE_V6_WORKERS: '48'
@@ -179,6 +195,8 @@ jobs:
           ulimit -n 65536 || true
           test -n "$SUBSTORE_BASE"
           test -n "$GIST_TOKEN"
+          test -n "$PROBE_STATE_REPO"
+          test -n "$PROBE_STATE_TOKEN"
           python scripts/actions_probe_all.py
       - name: Audit published artifacts for naming and dedup defects
         env:

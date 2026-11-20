@@ -4,3 +4,5 @@ __pycache__/
 *.secret
 probe-output/
 output/
+geo-cache*.json
+probe-state/

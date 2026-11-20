@@ -78,6 +78,41 @@ class FakeGist:
         return json.dumps({"public": self.public, "files": files}).encode(), {"ETag": '"version"'}
 
 
+class FixtureStateStore:
+    """Adapt the historical in-memory Gist fixture to the private store contract.
+
+    Only tests have this writer: production's legacy Gist interface is read-only.
+    Keeping this adapter preserves all existing failure-policy regression cases.
+    """
+
+    def __init__(self, gist_id, token, transport):
+        """Retain the legacy reader and fixture transport; never contact a network."""
+        self.reader = p.LegacyGistReader(gist_id, token, transport)
+        self.old = {}
+
+    def current(self):
+        """Read a simulated state snapshot and remember it for diff assertions."""
+        self.old, version = self.reader.current()
+        return self.old, version
+
+    def save(self, files, version):
+        """Commit changed fixture files together, including any policy deletions."""
+        updates = {name: {"content": text} for name, text in files.items()
+                   if text != self.old.get(name)}
+        updates.update({name: None for name in self.old if name not in files})
+        headers = dict(self.reader.headers, **{"Content-Type": "application/json"})
+        self.reader.transport("PATCH", self.reader.url, headers,
+                              p.json_text({"files": updates}).encode())
+
+
+class FixturePublisher(p.StatePublisher):
+    """Use the real policy publisher with the historical offline fixture store."""
+
+    def __init__(self, gist_id, token, transport):
+        """Build a fixture state store for existing policy scenarios."""
+        super().__init__(FixtureStateStore(gist_id, token, transport))
+
+
 class TraceTests(unittest.TestCase):
     GOOD = "visit_scheme=https\ntls=TLSv1.3\nfl=x\nip=8.8.8.8\nloc=US\n"
 
@@ -497,7 +532,7 @@ class PublisherTests(unittest.TestCase):
         self.old = p.plan_updates([self.initial], {})
 
     def publisher(self, transport):
-        return p.GistPublisher("abc123", "not-a-real-token", transport)
+        return FixturePublisher("abc123", "not-a-real-token", transport)
 
     def test_the_name_table_is_seeded_on_the_first_round_after_upgrade(self):
         legacy_manifest = {key: value for key, value in json.loads(self.old["manifest.json"]).items()
@@ -575,13 +610,13 @@ class PublisherTests(unittest.TestCase):
 
     def test_token_and_gist_id_outer_whitespace_stripped(self):
         remote = FakeGist(self.old)
-        publisher = p.GistPublisher("  abc123\r\n", "  test-token\r\n", remote)
+        publisher = FixturePublisher("  abc123\r\n", "  test-token\r\n", remote)
         publisher.publish([self.initial])
         self.assertEqual(remote.calls[0][2]["Authorization"], "Bearer test-token")
         self.assertEqual(remote.calls[0][1], "https://api.github.com/gists/abc123")
         for token in ("\r\n", "bad\r\ntoken"):
             with self.assertRaises(p.ProbeError):
-                p.GistPublisher("abc123", token, remote)
+                FixturePublisher("abc123", token, remote)
 
     def test_412_rereads_and_replans_bounded(self):
         remote = FakeGist(self.old)
@@ -628,9 +663,9 @@ class PublisherTests(unittest.TestCase):
                 manifest["concurrent_counter"] = len(reads)
                 remote.files["manifest.json"] = json.dumps(manifest)
             return remote(method, url, headers, body)
-        with self.assertRaises(p.ProbeError) as got:
+        with self.assertRaises(p.PublicationError) as got:
             self.publisher(transport).publish([candidate(count=5)])
-        self.assertEqual(p.error_code(got.exception), "gist_conflict")
+        self.assertEqual(p.error_code(got.exception), "state_conflict")
         self.assertEqual(len(reads), 6)
         self.assertEqual(remote.patches, [])
 
@@ -901,7 +936,11 @@ class RunnerTests(unittest.TestCase):
             return p.canonical({"proxies": [node()]}).encode(), {}
         def probe(graph, roots):
             return [p.Measurement(name, "8.8.8.8", "US") for name in roots], 0, 0
-        with tempfile.TemporaryDirectory() as temp:
+        failed_store = mock.Mock()
+        failed_store.current.return_value = ({}, None)
+        failed_store.save.side_effect = p.ProbeError("http_403")
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+                p, "publication_backends", return_value=(failed_store, None)):
             env = {"SUBSTORE_BASE": "https://fixture.invalid/SECRET", "PROBE_OUTPUT_DIR": temp, "GIST_TOKEN": "fixture\r\n", "GIST_ID": "abc123", "PROBE_FRONT_SUB": "", "PROBE_SOURCES_JSON": json.dumps(names + ["prologue"])}
             code, summary = p.run(env, transport, probe)
             self.assertEqual(code, 2)
@@ -915,7 +954,7 @@ class RunnerTests(unittest.TestCase):
             report = json.loads((Path(temp) / "measurement.json").read_text(encoding="utf-8"))
             self.assertEqual(report["alive"], 7)
             self.assertNotIn("SECRET", json.dumps(summary))
-            self.assertEqual(len(calls), 9)
+            self.assertEqual(len(calls), 8)
 
     def test_source_filter_missing_or_invalid_fails_before_download(self):
         for selected in ('[]', '{}', '["missing"]', '["airport", 3]', 'invalid'):
@@ -962,7 +1001,7 @@ class RunnerTests(unittest.TestCase):
     def test_empty_authoritative_source_list_fails_without_publish(self):
         transport = mock.Mock(return_value=(b'{"data":[]}', {}))
         with tempfile.TemporaryDirectory() as temp:
-            code, summary = p.run({"SUBSTORE_BASE": "https://fixture.invalid/private", "PROBE_OUTPUT_DIR": temp, "GIST_TOKEN": "fixture", "GIST_ID": "abc123"}, transport, mock.Mock())
+            code, summary = p.run({"SUBSTORE_BASE": "https://fixture.invalid/private", "PROBE_OUTPUT_DIR": temp}, transport, mock.Mock())
             self.assertEqual(code, 2)
             self.assertEqual(summary["failure"], 1)
             self.assertEqual(transport.call_count, 1)
@@ -1015,6 +1054,7 @@ class RunnerTests(unittest.TestCase):
                                    "PROBE_V6_SSH_PORT": "22"}, transport, Probe())
         self.assertEqual(code, 0)
         self.assertEqual([job["roots"] for job in seen["jobs"]], [["v6"]])
+        self.assertEqual([node["name"] for node in seen["jobs"][0]["config"]["proxies"]], ["v6"])
         self.assertTrue(summary["v6_helper"]["ok"])
         self.assertIn("helper_s", summary["timings"])
         self.assertIn("helper_wait_s", summary["timings"])
@@ -1028,7 +1068,7 @@ class NodeLevelPolicyTests(unittest.TestCase):
 
     def publish(self, files, results):
         remote = FakeGist(files)
-        status, plan = p.GistPublisher("abc123", "not-a-real-token", remote).publish(results)
+        status, plan = FixturePublisher("abc123", "not-a-real-token", remote).publish(results)
         return remote, status
 
     def state(self, remote):
@@ -1334,6 +1374,7 @@ class SourceSecretsTests(unittest.TestCase):
             '{"a": {"header": {"X": 1}}}',
             '{"a": {"query": {"t": 1}}}',
             '{"a": {"url": "ftp://other.example/sub"}}',
+            '{"a": {"url": "http://other.example/sub?token=private"}}',
             '{"a": {"url": "https://user:pass@other.example/sub"}}',
             '{"a": {"url": "not a url"}}',
         ]

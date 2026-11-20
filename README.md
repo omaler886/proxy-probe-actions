@@ -2,14 +2,21 @@
 
 Public execution repository. This tree is world-readable by design: subscription data and API tokens must never appear here — every credential lives in Actions secrets, and Git history is treated as public.
 
+Policy state now requires a **separate private GitHub repository**. The delivery
+Gist must contain **only `mihomo-alive.yaml`**. Existing installations need the
+[security migration](docs/SECURITY_MIGRATION.md) before using this workflow.
+A working proxy subscription still contains node credentials: its delivery URL
+must be shared only with trusted recipients.
+
 ## Pipeline
 
-1. Read original subscriptions from Sub-Store (`GET` only). Exclude generated `probe-*`, `chain-*`, `rust-*`, `测活-DMIT`, and `官方可用` sources to avoid feedback loops.
+1. Read original subscriptions from Sub-Store over **HTTPS** (`GET` only). HTTP, embedded URL credentials, fragments and cross-origin redirects are rejected. Exclude generated `probe-*`, `chain-*`, `rust-*`, `gist-*`, `测活-DMIT`, and `官方可用` sources to avoid feedback loops.
 2. Use native mihomo on the GitHub-hosted Ubuntu runner. Validate each node with its full dialer dependency closure; never strip a required dialer into a direct connection.
 3. Request `https://www.cloudflare.com/cdn-cgi/trace` through a node-specific loopback HTTP listener, with certificate validation and no direct fallback. Only a successful trace with a global `ip` and valid `loc` counts as alive. Every node gets a short first pass (a 1KB trace that needs longer is unusable); only failures spend the full timeout in a second pass, so a dead node costs fast+full instead of full+full. IPv6-bound nodes are settled by the helper host in parallel with the runner's own round.
-4. Rename from source/country/protocol/exit hash/connection fingerprint. Timing is not embedded in names.
-5. For **GlaDOS only**, group successful nodes by actual trace exit IP. For a duplicate-exit group prefer Shadowsocks (`ss`); if the group has no SS, keep one deterministic member. A unique exit is retained regardless of protocol (including AnyTLS/Trojan). This is NOT a global SS-only filter. Other sources keep their protocols and are not collapsed by exit.
-6. PATCH fixed files in the existing secret Gist. Retain unrelated Gist files. Same YAML content produces no new revision. GitHub Gist PATCH rejects `If-Match` (HTTP 400); instead serialize this workflow and recheck the managed-file snapshot before writing. This is not server-side atomic compare-and-swap: never add a second writer for these managed filenames.
+4. Rename from country/ASN brand and an optional local geo cache. Measurement never queries online geolocation providers. Timing is not embedded in names.
+5. Within each source, group successful nodes by actual trace exit IP. Prefer Shadowsocks (`ss`), then a stable connection fingerprint. Every distinct exit is retained regardless of protocol. This selection favors a stable representative, not necessarily the lowest-latency protocol.
+6. Commit source YAMLs, the merged YAML and `manifest.json` together as one JSON bundle in a **private** GitHub repository. Contents API blob SHA checks prevent stale state from overwriting a concurrent update. Retry IDs prevent an ambiguous write response from consuming two grace rounds.
+7. Deliver **only** the merged connection YAML into a separate unlisted Gist. Strip source annotations and dependency source namespaces; retain connection credentials and references. A Gist containing any additional file is rejected before measurement. Gist delivery remains a single-writer operation; it is not transactional with the private state commit.
 
 ## Failure policy (node-level, with a grace round)
 
@@ -31,7 +38,7 @@ round dialled it and the attempt failed.
 | nodes need IPv6 the host cannot reach | kept (unverifiable, never scored dead) |
 | a retained artifact is unparsable (`proxies: null`, truncated) | quarantined and deleted on the same PATCH instead of blocking the round |
 
-`bad_streak` in `manifest.json` is the consecutive-round counter that drives the
+`bad_streak` in the private `manifest.json` is the consecutive-round counter that drives the
 grace and counts **proven** failures only. `unproven_rounds` counts consecutive
 rounds that produced no node-level evidence at all (unfetchable source,
 unmeasurable nodes, unprovable front); it never deletes an artifact and exists
@@ -83,6 +90,30 @@ duplicate label), and independent sources share one kernel instead of one
 kernel per source. A shared kernel that fails falls back to one kernel per
 source automatically.
 
+`PROBE_CONCURRENCY` is a ceiling (64 by default). The adaptive pool uses fewer
+workers for small rounds and never raises that ceiling automatically. At most
+`PROBE_PER_ENDPOINT_CONCURRENCY` dials (8 by default) share a first-entry host,
+including nodes behind the same dialer front and ports on the same host. Groups
+are interleaved to reduce queue blocking. This is a **configured entry-host**
+limit: different hostnames or unknown shared exits cannot be reliably grouped
+before measurement. `dial_workers` and `per_entry_limit` report budgets, not
+observed throughput or proof that these settings are optimal.
+
+The optional `/delay` prefilter obeys the same entry-host limit. A local ASN
+download failure degrades new names instead of aborting measurement. Existing
+names remain frozen. Optional city enrichment can be generated separately:
+
+```sh
+python tools/enrich_geo_cache.py --input /private/exits.json --output /private/geo.json
+PROBE_GEO_CACHE=/private/geo.json python scripts/actions_probe_all.py
+```
+
+The input is a JSON list of `{"ip":"8.8.8.8","cc":"US"}` exit observations.
+Only the explicit enrichment command contacts online providers; the cache
+contains exit addresses, is written with mode 0600, expires after 30 days, and
+must not be committed or uploaded as a public artifact. Without it, new names
+use trace country and the local ASN database without inventing city data.
+
 Before measuring, the probe records the runner's own egress address with one
 direct trace. A node that reports that address never carried the request (a
 configuration bug or a silent DIRECT fallback); such a trace is counted in
@@ -106,8 +137,23 @@ location-restricted node may fail from GitHub even when reachable elsewhere.
 - `SUBSTORE_BASE`: complete Sub-Store backend base URL, stored only as an Actions Secret.
 - `GIST_TOKEN`: dedicated token with Gist access, stored only as an Actions Secret.
 - `GIST_ID`: the target Gist id, stored only as an Actions Secret. Treat it as sensitive — it is the only thing standing between the subscription and the world.
+- `PROBE_STATE_REPO`: `owner/repository` of a dedicated **private** state repository, with an existing `main` branch.
+- `PROBE_STATE_TOKEN`: a separate token scoped to Contents read/write for that private repository only. Metadata read is also needed to verify visibility. Do not reuse the Gist token.
+
+Optional Actions variables: `PROBE_STATE_BRANCH` (default `main`),
+`PROBE_STATE_PATH` (default `probe/state.json`), `PROBE_CONCURRENCY` (default 64)
+and `PROBE_PER_ENDPOINT_CONCURRENCY` (default 8). A `GIST_TOKEN`/`GIST_ID`
+configuration without a private state backend fails closed; there is no legacy
+multi-file Gist publishing fallback. Omitting both publication backends permits
+local-only runs into the private output directory.
 
 Gist `public: false` means **unlisted**, not access-controlled/private: holders of the raw URL can read the credentials in a subscription. The source code repository itself is public, so the Gist id must never be rendered into step summaries, logs, or committed files. Do not distribute raw URLs publicly.
+
+The optional IPv6 helper must use an explicit non-root account (workflow default
+`probe-v6`), a dedicated private key and pinned `known_hosts`. Missing pinning is
+an error; there is no `accept-new` fallback. Only target dependency closures
+are sent over SSH. The binary path is fixed on the worker; jobs cannot select
+an executable. See [helper setup](docs/IPV6_HELPER.md).
 
 ## Adding a subscription source
 
@@ -117,13 +163,18 @@ A source that needs its own credential (auth header, token query parameter, or a
 
 ## Outputs
 
-- `mihomo-alive.yaml`: fixed merged subscription (no per-run names).
-- `source-<sha256(source-name)>.yaml`: one stable file per source.
-- `manifest.json`: source names and counts, digest, and previous-result preservation flags.
+- Delivery Gist: `mihomo-alive.yaml`, the only shared file.
+- Private repository state bundle: the merged baseline, `source-<sha256(source-name)>.yaml` per source, and `manifest.json` containing names/counts/digests/preservation flags.
+- Private temporary output: working copies, candidate files and measurement diagnostics. These are not delivery files.
 
 No subscription/config files are uploaded as Actions artifacts or caches. Temporary runner storage is destroyed at job teardown. Logs contain aggregate counts only.
 
-A run can publish healthy sources and still finish nonzero if other sources failed; consult the count summary and manifest preservation flags. Failed is not evidence that those nodes are globally dead. Previous good sources stay in the merged subscription until replaced by a successful candidate or deliberately removed.
+Partial source failures do not make a guarded publication fail. A private-state
+or Gist write failure does fail the run. If Gist delivery fails after the state
+commit, `state_publication` records that commit and `publication` stays
+`pending_delivery`; the next successful round retries delivery. A failed run is
+not evidence that nodes are globally dead. Previous good sources stay in the
+merged subscription until replaced by a successful candidate or deliberately removed.
 
 ## Local tests
 
