@@ -1294,12 +1294,168 @@ class IPv6TransportTests(unittest.TestCase):
         patcher = mock.patch.object(p, "check_ipv6_connectivity", return_value=self.report())
         self.checker = patcher.start()
         self.addCleanup(patcher.stop)
+        monitor_patcher = mock.patch.object(p, "Ipv6HealthMonitor", autospec=True)
+        self.monitor_factory = monitor_patcher.start()
+        self.addCleanup(monitor_patcher.stop)
+        self.monitor = self.monitor_factory.return_value
+        self.monitor.report = self.report()
+        self.monitor.tcp_failed = self.monitor.udp_failed = False
+        self.monitor.checks = 2
 
     def measure(self, probe, config, evidence, degraded=False, skipped=None):
         """Measure one fixture source with supplied kernel evidence; return its result."""
         with mock.patch.object(probe, "validate", return_value=True), mock.patch.object(
                 probe, "_run_kernel", return_value=(evidence, degraded, skipped or set())):
             return p.measure_source("airport", config, None, probe)
+
+    def measure_monitored(self, probe, config, front=None, trace=None):
+        """Run the actual kernel lifecycle with fake processes, traces and a fake monitor."""
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(probe, "validate", return_value=True), mock.patch.object(
+                probe, "health", return_value=True), mock.patch.object(
+                probe, "trace", return_value=trace), mock.patch.object(
+                p.subprocess, "Popen", return_value=process):
+            return p.measure_source("airport", config, front, probe)
+
+    def test_recovered_tcp_outage_never_advances_grace_across_two_rounds(self):
+        """A watcher-observed outage protects both failed roots after healthy final checks."""
+        self.monitor.tcp_failed = True
+        config = {"proxies": [node("a", server="2606:4700::1111"),
+                               node("b", server="2606:4700::1001")]}
+        probe = p.NativeProbe("mihomo")
+        old = p.plan_updates([candidate(count=2)], {})
+        retained = old[p.source_file("airport")]
+        for _ in range(2):
+            result = self.measure_monitored(probe, config)
+            self.assertFalse(result.failed)
+            self.assertEqual((result.alive, result.measured, result.unverifiable), (0, 0, 2))
+            self.assertTrue(probe.ipv6)
+            old = p.plan_updates([result], old)
+            state = json.loads(old["manifest.json"])["sources"][p.source_file("airport")]
+            self.assertEqual((state["guard"], state["bad_streak"]), ("unverifiable", 0))
+            self.assertEqual(old[p.source_file("airport")], retained)
+        self.assertEqual(self.checker.call_count, 3)
+        self.assertEqual(self.monitor.start.call_count, 2)
+        self.assertEqual(self.monitor.stop.call_count, 2)
+        self.monitor_factory.assert_called_with(self.checker)
+        self.assertEqual(probe.ipv6_monitor_checks, 4)
+
+    def test_recovered_udp_outage_protects_udp_dependency_closure_only(self):
+        """A TCP target behind a UDP front stays unproven while TCP and IPv4 failures count."""
+        self.monitor.udp_failed = True
+        config = {"proxies": [node("target", **{"dialer-proxy": "front"}),
+                               node("tcp", server="2606:4700::1001"),
+                               node("udp4", proto="tuic")]}
+        front = {"proxies": [node("front", proto="tuic", server="2606:4700::1111")]}
+        probe = p.NativeProbe("mihomo")
+        result = self.measure_monitored(probe, config, front)
+        self.assertFalse(result.failed)
+        self.assertEqual((result.alive, result.measured, result.unverifiable), (0, 2, 1))
+        self.assertTrue(probe.ipv6_udp)
+        self.assertFalse(probe._ipv6_unverifiable(p.Graph(config, front), "target"))
+        self.assertTrue(probe._ipv6_failure_unverifiable(p.Graph(config, front), "target"))
+
+    def test_interruption_latches_reset_for_the_next_healthy_batch(self):
+        """An earlier outage does not skip roots or contaminate a later batch's failures."""
+        self.monitor.tcp_failed = True
+        config = {"proxies": [node("a", server="2606:4700::1111")]}
+        probe = p.NativeProbe("mihomo")
+        interrupted = self.measure_monitored(probe, config)
+        self.assertEqual(interrupted.unverifiable, 1)
+        self.monitor.tcp_failed = False
+        healthy = self.measure_monitored(probe, config)
+        self.assertFalse(healthy.failed)
+        self.assertEqual((healthy.alive, healthy.measured, healthy.unverifiable), (0, 1, 0))
+        self.assertFalse(probe._ipv6_tcp_interrupted)
+        self.assertTrue(probe.ipv6_tcp_interrupted)
+        self.assertEqual(probe.ipv6_monitor_checks, 4)
+        self.assertEqual(self.monitor.start.call_count, 2)
+
+    def test_monitor_only_starts_for_auto_detected_accepted_ipv6_roots(self):
+        """Overrides, unavailable IPv6, IPv4 roots and invalid definitions need no watcher."""
+        cases = ((True, True, "2606:4700::1111", True),
+                 (False, False, "2606:4700::1111", True),
+                 (None, False, "2606:4700::1111", True),
+                 (None, True, "example.invalid", True),
+                 (None, True, "2606:4700::1111", False))
+        for override, capable, server, valid in cases:
+            with self.subTest(override=override, capable=capable, server=server, valid=valid):
+                self.checker.return_value = self.report(capable, capable)
+                config = {"proxies": [node("a", server=server)]}
+                probe = p.NativeProbe("mihomo", ipv6=override)
+                if valid:
+                    result = self.measure_monitored(probe, config)
+                else:
+                    with mock.patch.object(probe, "validate", return_value=False):
+                        result = p.measure_source("airport", config, None, probe)
+                self.assertFalse(result.failed)
+                self.monitor_factory.assert_not_called()
+
+    def test_monitor_stops_and_latches_when_kernel_execution_raises(self):
+        """Kernel startup exceptions cannot leave the health watcher running."""
+        self.monitor.tcp_failed = True
+        config = {"proxies": [node("a", server="2606:4700::1111")]}
+        probe = p.NativeProbe("mihomo")
+        with mock.patch.object(probe, "validate", return_value=True), mock.patch.object(
+                p.subprocess, "Popen", side_effect=OSError("fixture start failure")):
+            result = p.measure_source("airport", config, None, probe)
+        self.assertTrue(result.failed)
+        self.assertEqual(result.error, "kernel_execution_failure")
+        self.monitor.start.assert_called_once_with()
+        self.monitor.stop.assert_called_once_with()
+        self.assertTrue(probe._ipv6_tcp_interrupted)
+
+    def test_merged_monitor_protects_failed_sources_after_recovery(self):
+        """Shared kernels apply the same interruption latch and preserve successful roots."""
+        self.monitor.tcp_failed = True
+        configs = {"live": {"proxies": [node("a", server="2606:4700::1111")]},
+                   "failed": {"proxies": [node("b", server="2606:4700::1001")]}}
+        probe = p.NativeProbe("mihomo", workers=1)
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(probe, "validate", return_value=True), mock.patch.object(
+                probe, "health", return_value=True), mock.patch.object(
+                probe, "trace", side_effect=[("8.8.8.8", "US", "2", 20), None, None]), mock.patch.object(
+                p.subprocess, "Popen", return_value=process):
+            results = p.measure_all(list(configs), configs, None, probe)
+        self.assertTrue(all(not result.failed for result in results))
+        self.assertEqual([result.alive for result in results], [1, 0])
+        self.assertEqual([result.unverifiable for result in results], [0, 1])
+        self.assertEqual([result.measured for result in results], [1, 0])
+        self.assertTrue(probe.ipv6)
+        self.monitor.stop.assert_called_once_with()
+
+    def test_interrupted_monitor_preserves_success_and_reports_aggregate_counts(self):
+        """Positive traces survive both interruption flags; summaries contain no monitor details."""
+        self.monitor.tcp_failed = self.monitor.udp_failed = True
+        self.monitor.report = dict(self.report(), private_target="must-not-expose")
+        config = {"proxies": [node("a", proto="tuic", server="2606:4700::1111")]}
+        probe = p.NativeProbe("mihomo")
+        process = mock.Mock()
+        process.poll.return_value = None
+
+        def transport(method, url, headers=None, body=None):
+            """Return the selected fixture source and its definition without real HTTP."""
+            if url.endswith("/api/subs"):
+                return b'{"data":[{"name":"airport"}]}', {}
+            return p.canonical(config).encode(), {}
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                probe, "validate", return_value=True), mock.patch.object(
+                probe, "health", return_value=True), mock.patch.object(
+                probe, "trace", return_value=("8.8.8.8", "US", "2", 20)), mock.patch.object(
+                p.subprocess, "Popen", return_value=process):
+            code, summary = p.run({"SUBSTORE_BASE": "https://fixture.invalid/private",
+                                   "PROBE_FRONT_SUB": "", "PROBE_OUTPUT_DIR": directory}, transport, probe)
+        self.assertEqual(code, 0, summary)
+        self.assertEqual((summary["alive"], summary["unverifiable"]), (1, 0))
+        report = summary["ipv6_transport"]
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["monitor_checks"], 2)
+        self.assertTrue(report["tcp_interrupted"])
+        self.assertTrue(report["udp_interrupted"])
+        self.assertNotIn("must-not-expose", json.dumps(summary))
 
     def test_auto_detection_keeps_tcp_and_udp_snapshot(self):
         """A working TCP route does not imply the host can carry UDP adapters."""

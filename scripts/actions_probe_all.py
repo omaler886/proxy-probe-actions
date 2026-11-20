@@ -47,7 +47,7 @@ import yaml
 # in isolation (offline) and replaced without touching the probe contract.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import geo_naming  # noqa: E402
-from ipv6_transport import check_ipv6_connectivity  # noqa: E402
+from ipv6_transport import Ipv6HealthMonitor, check_ipv6_connectivity  # noqa: E402
 from publication import DeliveryGist, PrivateStateStore, PublicationError  # noqa: E402
 from probe_limits import EndpointLimiter, choose_workers, interleave_endpoints  # noqa: E402
 
@@ -748,6 +748,10 @@ class NativeProbe:
         self._ipv6_override = ipv6
         self.ipv6_report = {"ok": bool(ipv6), "tcp_ok": bool(ipv6),
                             "udp_ok": bool(ipv6), "checks": {}, "override": True}
+        # Batch latches protect failures; round totals survive later healthy batches.
+        self._ipv6_tcp_interrupted = self._ipv6_udp_interrupted = False
+        self.ipv6_monitor_checks = 0
+        self.ipv6_tcp_interrupted = self.ipv6_udp_interrupted = False
         self.refresh_ipv6_health()
 
     def refresh_ipv6_health(self):
@@ -764,15 +768,25 @@ class NativeProbe:
             return False
         if not self.ipv6:
             return True
-        if self.ipv6_udp:
-            return False
+        return not self.ipv6_udp and self._ipv6_needs_udp(graph, root)
+
+    def _ipv6_needs_udp(self, graph, root):
+        """Return whether the root's dependency closure includes a UDP adapter."""
         try:
             nodes, _ = graph.closure([root])
         except ProbeError:
             return False  # Kernel validation owns attribution for invalid definitions.
-        needs_udp = any(str(graph.nodes[name].get("type", "")).lower() in IPV6_UDP_ADAPTERS
-                        for name in nodes)
-        return needs_udp and not self.ipv6_udp
+        return any(str(graph.nodes[name].get("type", "")).lower() in IPV6_UDP_ADAPTERS
+                   for name in nodes)
+
+    def _ipv6_failure_unverifiable(self, graph, root):
+        """Return whether current or observed batch outages make a root's failure unprovable."""
+        if self._ipv6_unverifiable(graph, root):
+            return True
+        if not graph.v6_bound(root):
+            return False
+        return (self._ipv6_tcp_interrupted
+                or (self._ipv6_udp_interrupted and self._ipv6_needs_udp(graph, root)))
 
     def validate(self, directory, cfg):
         path = Path(directory) / "config.yaml"
@@ -988,7 +1002,7 @@ class NativeProbe:
         return delays, skipped
 
     def _run_kernel(self, directory, lanes, controller, secret, degrade_end=False,
-                    endpoint_keys=None):
+                    endpoint_keys=None, monitor_ipv6=False):
         """Start one kernel over ``lanes`` and return evidence aligned with it.
 
         ``lanes`` is ``[(proxy_name, port)]``. Returns ``(evidence, degraded)``
@@ -998,9 +1012,15 @@ class NativeProbe:
         failed lane there is NOT death evidence and the caller marks it
         unverifiable instead of deleting a node. ``degrade_end=False`` keeps the
         per-source contract: a dead kernel discards that source's round.
+        ``monitor_ipv6`` latches automatic transport checks across both passes
+        so recovery before the final snapshot cannot turn outages into node failures.
         """
-        process = None
+        process = monitor = None
+        self._ipv6_tcp_interrupted = self._ipv6_udp_interrupted = False
         try:
+            if monitor_ipv6 and self._ipv6_override is None and self.ipv6:
+                monitor = Ipv6HealthMonitor(check_ipv6_connectivity)
+                monitor.start()
             process = subprocess.Popen([self.binary, "-d", str(directory), "-f", str(directory / "config.yaml")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_environment())
             deadline = time.monotonic() + 15
             while not self.health(process, controller, secret, once=True):
@@ -1056,14 +1076,23 @@ class NativeProbe:
         except OSError:
             raise ProbeError("kernel_execution_failure") from None
         finally:
-            if process is not None:
-                if process.poll() is None:
-                    process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+            try:
+                if process is not None:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            finally:
+                if monitor is not None:
+                    monitor.stop()
+                    self._ipv6_tcp_interrupted = bool(monitor.tcp_failed)
+                    self._ipv6_udp_interrupted = bool(monitor.udp_failed)
+                    self.ipv6_monitor_checks += monitor.checks
+                    self.ipv6_tcp_interrupted |= self._ipv6_tcp_interrupted
+                    self.ipv6_udp_interrupted |= self._ipv6_udp_interrupted
 
     def _export_entries(self, entries):
         """Export entries into ONE kernel document; return (document, lanes).
@@ -1151,7 +1180,8 @@ class NativeProbe:
                 endpoint_keys = [job.graph.entry_host(root) for _, job, root in accepted]
                 evidence, degraded, skipped = self._run_kernel(
                     directory, list(zip(lanes, ports[:-1])), controller, secret,
-                    degrade_end=True, endpoint_keys=endpoint_keys)
+                    degrade_end=True, endpoint_keys=endpoint_keys,
+                    monitor_ipv6=any(job.graph.v6_bound(root) for _, job, root in accepted))
             else:
                 evidence, degraded, skipped = [], False, set()
         self.merged_groups += 1
@@ -1173,7 +1203,7 @@ class NativeProbe:
                     continue
                 item, delay = value
                 if item is None or item is DIRECT_LEAK:
-                    if degraded or self._ipv6_unverifiable(job.graph, group[0]):
+                    if degraded or self._ipv6_failure_unverifiable(job.graph, group[0]):
                         unverifiable[job_index] += len(group)
                     continue
                 ip, cc, version, elapsed_ms = item
@@ -1262,7 +1292,8 @@ class NativeProbe:
                 raise ProbeError("kernel_config_failure")
             evidence, degraded, _skipped = self._run_kernel(
                 directory, list(zip(accepted, ports[:-1])), controller, secret,
-                endpoint_keys=[graph.entry_host(root) for root in accepted])
+                endpoint_keys=[graph.entry_host(root) for root in accepted],
+                monitor_ipv6=any(graph.v6_bound(root) for root in accepted))
         index_of = {root: index for index, root in enumerate(accepted)}
         invalid_set = set(invalid)
         invalid_count = sum(len(group) for group in measurable if group[0] in invalid_set)
@@ -1276,7 +1307,7 @@ class NativeProbe:
             if item is None or item is DIRECT_LEAK:
                 # A kernel that died at the end cannot turn its own silence
                 # into death evidence; the round's positives still stand.
-                if degraded or self._ipv6_unverifiable(graph, group[0]):
+                if degraded or self._ipv6_failure_unverifiable(graph, group[0]):
                     unverifiable += len(group)
                 continue
             ip, cc, version, elapsed_ms = item
@@ -2425,6 +2456,12 @@ def run(env=None, transport=None, probe=None):
             checks = ipv6_report.get("checks")
             if isinstance(checks, (dict, list, tuple)):
                 summary["ipv6_transport"]["checks"] = len(checks)
+        for key, attribute in (("monitor_checks", "ipv6_monitor_checks"),
+                               ("tcp_interrupted", "ipv6_tcp_interrupted"),
+                               ("udp_interrupted", "ipv6_udp_interrupted")):
+            value = getattr(probe, attribute, None)
+            if type(value) in {bool, int}:
+                summary["ipv6_transport"][key] = value
         summary["unverifiable"] = sum(item.unverifiable for item in results)
         # Traces that came back with the runner's own address: the node did not
         # carry them. Should be 0; anything else is a leak worth investigating.

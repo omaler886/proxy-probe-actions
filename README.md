@@ -137,8 +137,9 @@ first, with MASQUE as a fallback. WARP is disconnected during job cleanup.
 
 UDP capability is checked separately using real IPv6 DNS datagrams. Without it,
 IPv6 UDP adapters (including Hysteria2/TUIC/WireGuard) remain `unverifiable`.
-The same checks run after measurement: if the transport degrades, failed IPv6
-attempts remain unjudged while successful node traces are retained. The summary
+The same checks run during and after measurement: any observed interruption is
+latched for the batch, so recovery before the final check cannot turn earlier
+failed IPv6 attempts into death evidence. Successful node traces are retained. The summary
 reports aggregate evidence in `ipv6_transport`. A route lookup or `warp=on`
 alone never enables node death evidence. See [runner IPv6 setup](docs/RUNNER_IPV6.md).
 

@@ -33,6 +33,27 @@ disconnect_warp() {
   run_warp_cli disconnect || true
 }
 
+# Purpose: disconnect WARP after an unexpected setup failure. Args: none.
+# Return: preserve the original failing exit status.
+cleanup_failed_setup() {
+  local status=$?
+  if (( status != 0 )) && command -v warp-cli >/dev/null 2>&1; then
+    disconnect_warp
+    if [[ -n "${baseline_v4:-}" ]]; then
+      touch "$state_dir/routing-unverified"
+      local restored
+      restored="$(read_ipv4_baseline)" || restored='unverified'
+      if [[ "$restored" == "$baseline_v4" ]]; then
+        rm -f -- "$state_dir/routing-unverified"
+      else
+        echo 'runner_ipv6_error=ipv4_restoration_unverified'
+      fi
+    fi
+  fi
+  return "$status"
+}
+trap cleanup_failed_setup EXIT
+
 # Purpose: verify the live v6 path and the unchanged v4 path. Args: baseline string.
 # Return: success only when both routing assertions hold.
 verify_paths() {
@@ -43,6 +64,7 @@ verify_paths() {
     echo 'runner_ipv6_error=ipv4_path_changed'
     return 1
   fi
+  rm -f -- "$state_dir/routing-unverified"
   python3 "$task_root/scripts/ipv6_transport.py" --report "$state_dir/network.json"
 }
 
@@ -81,8 +103,8 @@ for attempt in {1..15}; do
 done
 run_warp_cli registration new
 run_warp_cli mode tunnel_only
-# A new consumer registration uses Exclude mode. Runtime assertions below must
-# still prove that this /0 exclusion leaves the real IPv4 egress untouched.
+# Request the IPv4 exclusion on the new registration. Runtime assertions below
+# must prove the effective split-tunnel mode leaves the IPv4 egress untouched.
 run_warp_cli tunnel ip add-range 0.0.0.0/0
 
 for protocol in WireGuard MASQUE; do
@@ -91,6 +113,7 @@ for protocol in WireGuard MASQUE; do
     echo "runner_ipv6_protocol_unavailable=$protocol"
     continue
   fi
+  touch "$state_dir/routing-unverified"
   if ! run_warp_cli connect; then
     continue
   fi

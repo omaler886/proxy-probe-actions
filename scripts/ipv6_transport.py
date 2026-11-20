@@ -13,6 +13,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 
 
 TCP_TARGETS = (
@@ -112,6 +113,55 @@ def check_ipv6_connectivity():
     if not report["ok"]:
         report["error"] = "ipv6_https_unverified"
     return report
+
+
+class Ipv6HealthMonitor:
+    """Latch observed IPv6 transport interruptions throughout one measurement batch."""
+
+    def __init__(self, checker=check_ipv6_connectivity, interval=2):
+        """Retain a bounded checker and heartbeat period; initialize aggregate evidence."""
+        self.checker = checker
+        self.interval = max(0.05, float(interval))
+        self.report = {}
+        self.tcp_failed = False
+        self.udp_failed = False
+        self.checks = 0
+        self._stopped = threading.Event()
+        self._thread = None
+
+    def start(self):
+        """Start one background health watcher and return this monitor."""
+        if self._thread is not None:
+            raise RuntimeError("ipv6_monitor_started")
+        self._thread = threading.Thread(target=self._watch, name="probe-ipv6-health", daemon=True)
+        self._thread.start()
+        return self
+
+    def _watch(self):
+        """Repeatedly check connectivity and retain failures even when later checks recover."""
+        while not self._stopped.is_set():
+            try:
+                report = self.checker()
+                self.report = report
+                self.tcp_failed |= not bool(report.get("ok"))
+                self.udp_failed |= not bool(report.get("udp_ok"))
+            except Exception:
+                # A broken observer proves nothing about a node. Do not let a
+                # background-thread exception disappear as a healthy snapshot.
+                self.report = {"ok": False, "udp_ok": False, "error": "ipv6_monitor_failed"}
+                self.tcp_failed = self.udp_failed = True
+            self.checks += 1
+            self._stopped.wait(self.interval)
+
+    def stop(self):
+        """Stop future heartbeats and collect the in-flight bounded network check."""
+        self._stopped.set()
+        if self._thread is not None:
+            self._thread.join(timeout=CHECK_TIMEOUT + 4)
+            if self._thread.is_alive():
+                self.tcp_failed = self.udp_failed = True
+                self.report = {"ok": False, "udp_ok": False, "error": "ipv6_monitor_stalled"}
+        return self.report
 
 
 def write_report(path, report):

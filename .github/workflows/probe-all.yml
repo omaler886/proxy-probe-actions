@@ -159,6 +159,9 @@ jobs:
           # One fd per in-flight dial plus the kernel's listeners. The raised
           # concurrency is I/O bound, so the fd ceiling is the real limit.
           ulimit -n 65536 || true
+          # If a failed setup could not verify IPv4 restoration, do not turn
+          # changed observer routing into node death evidence or publication.
+          test ! -f "$RUNNER_TEMP/probe-ipv6/routing-unverified"
           test -n "$SUBSTORE_BASE"
           if [ "$PROBE_DRY_RUN" != 'true' ]; then
             test -n "$GIST_TOKEN"

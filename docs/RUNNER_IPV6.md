@@ -29,14 +29,21 @@ in the private temporary runner directory and never uploaded.
 
 The setup receives no subscription or publication secrets. Its routing changes
 apply only to the ephemeral job; the workflow disconnects WARP in an `always()`
-cleanup step. The production probe can continue with IPv4 if setup fails.
+cleanup step and the setup also disconnects on errors. The production probe can
+continue with IPv4 if setup fails and the original IPv4 route is verified. If
+restoration cannot be verified, a local marker prevents measurement/publication
+from treating a changed observer route as node-death evidence.
 
 ## Measurement and failure attribution
 
 `NativeProbe` obtains a fresh `ipv6_transport` snapshot before measuring. Roots
 requiring IPv6 remain unjudgeable without the verified transport; UDP-based
-adapters additionally require the separate UDP capability. The post-measurement
-check protects failures if the tunnel stops working mid-round. Existing source
+adapters additionally require the separate UDP capability. During a batch a
+background heartbeat retains any observed TCP/UDP interruption, even if a later
+sample recovers. Failed nodes using the interrupted transport remain unjudged;
+successful traces are retained. A post-measurement check also protects failures
+if the tunnel is still down at the end. This is sampled observer evidence, not
+a proof that every packet between samples was delivered. Existing source
 grace policy and successful traces are retained.
 
 `PROBE_IPV6=0/1` remains an explicit local testing override; production workflows
@@ -69,3 +76,11 @@ Official references:
 
 The CLI grammar is verified against the pinned binary. Effective `/0` exclusion
 and public IPv6 transport are runtime assertions, not inferred from the CLI help.
+
+## Verified Actions evidence (2026-11-20)
+
+- [Initial native/WARP and real-node smoke](https://github.com/omaler886/proxy-probe-actions/actions/runs/44713953533): native IPv6 had no route; WARP WireGuard established IPv6 with HTTPS 2/2 and UDP 2/2 passing, while the IPv4 baseline was unchanged. Seven of eight IPv6-entry VLESS nodes returned a verified trace.
+- [Protocol-diverse smoke](https://github.com/omaler886/proxy-probe-actions/actions/runs/44716125187): the same transport checks passed; twelve nodes were sampled (six VLESS and six MASQUE), with five VLESS traces successful and no MASQUE traces successful. Kernel validation rejected none. This proves the local tunnel and real VLESS entry measurement; it does **not** establish that the tested MASQUE nodes are healthy or that every UDP-based proxy works through WARP.
+- [Full pipeline dry run](https://github.com/omaler886/proxy-probe-actions/actions/runs/44716304339): 38 sources, 2,162 input nodes, 1,421 successful traces, zero unverifiable nodes and zero direct-leak detections. Measurement took 93.4 seconds; the probe's total was 109.1 seconds. HTTPS and UDP IPv6 checks passed before and after measurement. Publication was `local_only`; production state was untouched. These counts are one observer's round, not a guarantee of global node availability.
+
+These jobs receive no publication tokens and update no production failure state.

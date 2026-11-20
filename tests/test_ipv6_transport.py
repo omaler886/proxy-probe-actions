@@ -8,6 +8,7 @@ import socket
 import struct
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -108,6 +109,41 @@ class Ipv6ConnectivityTests(unittest.TestCase):
                 "sys.stdout", new_callable=io.StringIO) as output:
             self.assertEqual(network.main(), 1)
         self.assertEqual(json.loads(output.getvalue()), {"ok": False})
+
+    def test_monitor_retains_mid_round_outage_after_recovery(self):
+        """A healthy last sample must not erase an observed transport interruption."""
+        recovered = threading.Event()
+        reports = iter([{"ok": False, "udp_ok": False}, {"ok": True, "udp_ok": True}])
+
+        def checker():
+            """Return two transport snapshots and signal when the final one is observed."""
+            report = next(reports, {"ok": True, "udp_ok": True})
+            if report["ok"]:
+                recovered.set()
+            return report
+
+        monitor = network.Ipv6HealthMonitor(checker, interval=0.05).start()
+        self.assertTrue(recovered.wait(timeout=2))
+        monitor.stop()
+        self.assertTrue(monitor.report["ok"])
+        self.assertTrue(monitor.tcp_failed)
+        self.assertTrue(monitor.udp_failed)
+        self.assertGreaterEqual(monitor.checks, 2)
+
+    def test_monitor_error_is_latched_as_observer_failure(self):
+        """A checker exception cannot disappear inside a daemon thread as healthy evidence."""
+        checked = threading.Event()
+
+        def checker():
+            """Signal one bounded failed health sample without contacting the network."""
+            checked.set()
+            raise OSError("fixture network error")
+
+        monitor = network.Ipv6HealthMonitor(checker, interval=0.05).start()
+        self.assertTrue(checked.wait(timeout=2))
+        monitor.stop()
+        self.assertTrue(monitor.tcp_failed)
+        self.assertTrue(monitor.udp_failed)
 
 
 class ReadOnlySmokeTests(unittest.TestCase):
