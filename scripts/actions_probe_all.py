@@ -147,6 +147,24 @@ def ipv6_override(value):
     return None
 
 
+def env_flag(value, default=True):
+    """Boolean env switch; an empty/unset value keeps ``default``."""
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    return text not in {"0", "false", "no", "off"}
+
+
+def env_int(value, default, low=0, high=10 ** 9):
+    """Bounded integer env switch; malformed input falls back to ``default``."""
+    try:
+        return max(low, min(high, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
 def merge_v6_results(results, payload):
     """Apply a v6 worker's verdicts to this round's source results.
 
@@ -610,14 +628,26 @@ def unused_ports(count):
 
 
 def kernel_config(graph, roots, ports, controller, secret):
-    cfg = graph.export(roots)
+    return kernel_config_document(graph.export(roots), roots, ports, controller, secret)
+
+
+def kernel_config_document(document, lanes, ports, controller, secret):
+    """Kernel body for already-exported proxies/groups.
+
+    ``lanes`` holds one proxy name per listener, aligned with ``ports``. Keeping
+    this separate lets a merged round concatenate several sources' exports into
+    ONE kernel while each lane still remembers which source root it belongs to.
+    """
+    cfg = {"proxies": list(document.get("proxies") or [])}
+    if document.get("proxy-groups"):
+        cfg["proxy-groups"] = list(document["proxy-groups"])
     cfg.update({
         "allow-lan": False, "bind-address": "127.0.0.1", "mode": "rule",
         "ipv6": True, "log-level": "silent", "external-controller": "127.0.0.1:" + str(controller),
         "secret": secret, "external-ui": "", "geodata-mode": False, "geo-auto-update": False,
         "find-process-mode": "off", "profile": {"store-selected": False, "store-fake-ip": False},
         "dns": {"enable": False}, "tun": {"enable": False},
-        "listeners": [{"name": "lane-" + str(index), "type": "http", "listen": "127.0.0.1", "port": port, "proxy": root} for index, (root, port) in enumerate(zip(roots, ports))],
+        "listeners": [{"name": "lane-" + str(index), "type": "http", "listen": "127.0.0.1", "port": port, "proxy": lane} for index, (lane, port) in enumerate(zip(lanes, ports))],
         "rules": ["MATCH,REJECT"],
     })
     return cfg
@@ -657,6 +687,10 @@ class Measurement:
     #: Negotiated protocol from curl ("2", "1.1", ...); empty when unknown
     #: (for example a v6 node settled by the helper, which does not report it).
     http_version: str = ""
+    #: Round-trip milliseconds from the kernel's own delay probe. 0 means "no
+    #: evidence" (prefilter disabled, or the node was settled by the v6 helper),
+    #: never "0 ms".
+    delay_ms: int = 0
 
 
 @dataclass
@@ -689,6 +723,15 @@ class SourceResult:
     measurements: list = field(default_factory=list)
     #: Roots this round skipped because they need an IPv6 route the host lacks.
     v6_roots: list = field(default_factory=list)
+    #: Egress latency of alive nodes, from the kernel delay probe. Audit only:
+    #: latency is never part of a connection fingerprint/name.
+    delay_median_ms: int = 0
+    delay_p90_ms: int = 0
+    #: Exit vs node ``server`` literal: {"same", "transit", "unknown"} counts.
+    #: "transit" is a legitimate relay/CDN, not a defect; it is annotated only.
+    landing: dict = field(default_factory=dict)
+    #: Egress ASN class counts (cdn/datacenter/residential/mobile/unknown).
+    asn_class: dict = field(default_factory=dict)
 
 
 #: Upper bound on concurrent node dials. Each dial is one 1KB trace through the
@@ -698,8 +741,26 @@ class SourceResult:
 MAX_WORKERS = 256
 
 
+@dataclass
+class SourceJob:
+    """One source prepared for measurement, independent of the kernel shape.
+
+    Preparing (graph resolution, front attribution, v6 classification) is
+    separate from measuring so several jobs can share one kernel and still be
+    reported per source.
+    """
+    name: str
+    config: dict
+    graph: Graph
+    roots: list
+    front_only: set
+    uses_front: bool
+    v6_roots: list = field(default_factory=list)
+
+
 class NativeProbe:
-    def __init__(self, binary, workers=8, timeout=15, transport=None, ipv6=None):
+    def __init__(self, binary, workers=8, timeout=15, transport=None, ipv6=None,
+                 delay_ms=0, kernel_batch=0, dedupe=False):
         self.binary = binary
         self.workers = max(1, min(MAX_WORKERS, int(workers)))
         self.timeout = max(1, min(120, int(timeout)))
@@ -714,6 +775,21 @@ class NativeProbe:
         self.baseline_ip = None
         #: Measurements dropped because they came out of the runner itself.
         self.suppressed = 0
+        #: Roots skipped before curl because the kernel's own delay probe
+        #: failed. 0 when the prefilter is disabled.
+        self.prefiltered = 0
+        #: Interchangeable duplicate definitions collapsed before dialling.
+        self.dedup_saved = 0
+        #: Number of multi-source kernels started this round.
+        self.merged_groups = 0
+        #: ``/proxies/<name>/delay`` budget in ms; 0 disables the prefilter.
+        #: It runs BEFORE curl, so a dead node costs one 2s API call instead of
+        #: a short trace plus a full retry. Delay is also kept as evidence.
+        self.delay_ms = max(0, min(30000, int(delay_ms or 0)))
+        #: Sources per shared kernel; 0 = one kernel for the whole round.
+        self.kernel_batch = max(0, int(kernel_batch or 0))
+        #: Collapse identical connection definitions within one source.
+        self.dedupe = bool(dedupe)
         # IPv6 capability is a HOST property. When the host cannot reach IPv6,
         # a node with an IPv6 literal server is unverifiable from here, never
         # dead: it may be alive on the user's own IPv6 network.
@@ -848,24 +924,284 @@ class NativeProbe:
         self._assess(directory, graph, batch[:mid], secret, accepted, invalid)
         self._assess(directory, graph, batch[mid:], secret, accepted, invalid)
 
+    def delay_probe(self, controller, secret, name):
+        """Ask the kernel to dial one proxy and report latency.
+
+        Returns ``(ok, delay_ms, infra)``. ``infra`` means the controller
+        itself could not answer (bad secret, unknown proxy name, closed port):
+        the caller must fall back to curl instead of declaring the node dead.
+        A 408/504 is the kernel's own verdict that the node could not deliver
+        the request in the budget, which is a real negative.
+        """
+        url = ("http://127.0.0.1:" + str(controller) + "/proxies/"
+               + urllib.parse.quote(str(name), safe="") + "/delay?"
+               + urllib.parse.urlencode({"timeout": self.delay_ms, "url": TRACE_URL}))
+        request = urllib.request.Request(url, headers={"Authorization": "Bearer " + secret})
+        try:
+            with self.opener.open(request, timeout=self.delay_ms / 1000.0 + 2) as response:
+                document = json.loads(response.read())
+            delay = int(document.get("delay") or 0)
+            return (delay > 0, delay, False)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (408, 504):
+                return (False, 0, False)
+            return (False, 0, True)
+        except Exception:
+            return (False, 0, True)
+
+    def _prefilter(self, lanes, controller, secret):
+        """Run the kernel delay probe over every lane, aligned by index.
+
+        Returns ``({index: delay_ms}, {skipped_index})``. A controller-level
+        error leaves the lane OUT of ``skipped``: it is traced by curl exactly
+        as before, so an API regression can never manufacture dead nodes.
+        """
+        if not self.delay_ms:
+            return {}, set()
+        delays, skipped = {}, set()
+        # The controller answers these in parallel; 32 left dead nodes queuing
+        # (2s each) behind the pool. Use the round's dial concurrency as the
+        # ceiling so the prefilter cannot become the new bottleneck.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(self.workers, 128))) as pool:
+            outcomes = list(pool.map(lambda lane: self.delay_probe(controller, secret, lane[0]), lanes))
+        for index, (ok, delay, infra) in enumerate(outcomes):
+            if infra:
+                continue
+            if ok:
+                delays[index] = delay
+            else:
+                skipped.add(index)
+        self.prefiltered += len(skipped)
+        return delays, skipped
+
+    def _run_kernel(self, directory, lanes, controller, secret, degrade_end=False):
+        """Start one kernel over ``lanes`` and return evidence aligned with it.
+
+        ``lanes`` is ``[(proxy_name, port)]``. Returns ``(evidence, degraded)``
+        where ``evidence[i]`` is ``((ip, cc, http_version), delay_ms)``,
+        ``(None, delay_ms)``, or ``(DIRECT_LEAK, delay_ms)``. ``degraded`` means
+        the kernel died between the last trace and the final health check, so a
+        failed lane there is NOT death evidence and the caller marks it
+        unverifiable instead of deleting a node. ``degrade_end=False`` keeps the
+        per-source contract: a dead kernel discards that source's round.
+        """
+        process = None
+        try:
+            process = subprocess.Popen([self.binary, "-d", str(directory), "-f", str(directory / "config.yaml")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            deadline = time.monotonic() + 15
+            while not self.health(process, controller, secret, once=True):
+                if process.poll() is not None or time.monotonic() > deadline:
+                    raise ProbeError("kernel_start_failure")
+                time.sleep(0.05)
+            # Delay pre-screen BEFORE curl: the kernel answers in its own
+            # socket, with no fork, no temp file, and one request per node.
+            delays, skipped = self._prefilter(lanes, controller, secret)
+            # Two passes, not "the same attempt twice". Pass 1 gives every
+            # node a short budget; nothing that needs longer than that for
+            # 1KB is usable anyway. Only the failures spend the full budget
+            # in pass 2, so a transient error still gets its retry while a
+            # dead node stops costing 2 x the full timeout.
+            fast = max(3, min(6, self.timeout // 3))
+            evidence = [None] * len(lanes)
+            active = [index for index in range(len(lanes)) if index not in skipped]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
+                for index, item in zip(active, pool.map(lambda index: self.trace(lanes[index][1], directory, fast), active)):
+                    evidence[index] = item
+                retry = [index for index in active if evidence[index] is None]
+                if retry:
+                    for index, item in zip(retry, pool.map(lambda index: self.trace(lanes[index][1], directory), retry)):
+                        evidence[index] = item
+            healthy = self.health(process, controller, secret)
+            if not healthy and not degrade_end:
+                raise ProbeError("kernel_end_failure")
+            normalized = []
+            for index in range(len(lanes)):
+                item = evidence[index]
+                if isinstance(item, tuple) and len(item) == 2:
+                    # Tolerate the old two-field shape (tests/fakes); the
+                    # production trace returns (ip, cc, http_version).
+                    item = (item[0], item[1], "")
+                normalized.append((item, delays.get(index, 0)))
+            return normalized, not healthy
+        except OSError:
+            raise ProbeError("kernel_execution_failure") from None
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+    def _export_entries(self, entries):
+        """Export entries into ONE kernel document; return (document, lanes).
+
+        ``entries`` is ``[(job_index, job, representative_root)]``. Proxy and
+        group names are namespaced by job index so two sources may carry the
+        same node name without colliding; ``lanes`` stays aligned with
+        ``entries`` so evidence maps back to the right source root.
+        """
+        by_job = {}
+        for job_index, job, root in entries:
+            by_job.setdefault(job_index, (job, []))[1].append(root)
+        proxies, groups, lane_of = [], [], {}
+        for job_index in sorted(by_job):
+            job, roots = by_job[job_index]
+            nodes, group_names = job.graph.closure(roots)
+            names = {name: "s%d-n%s" % (job_index, job.graph.identity(name)[:16]) for name in nodes}
+            names.update({name: "s%d-g%s" % (job_index, job.graph.identity(name)[:16]) for name in group_names})
+            document = job.graph.export(roots, names)
+            proxies.extend(document.get("proxies") or [])
+            groups.extend(document.get("proxy-groups") or [])
+            for root in roots:
+                lane_of[(job_index, root)] = names[root]
+        return ({"proxies": proxies, "proxy-groups": groups},
+                [lane_of[(job_index, root)] for job_index, job, root in entries])
+
+    def _valid_entries(self, directory, entries, secret):
+        """One kernel validation over a merged subset's complete closures."""
+        try:
+            document, lanes = self._export_entries(entries)
+            ports = unused_ports(len(lanes) + 1)
+            cfg = kernel_config_document(document, lanes, ports[:-1], ports[-1], secret)
+        except ProbeError as exc:
+            if str(exc).startswith("kernel_"):
+                raise
+            return False
+        return self.validate(directory, cfg)
+
+    def _assess_entries(self, directory, entries, secret, accepted, invalid):
+        """Bisect a merged batch so a bad root is attributed to its source."""
+        if self._valid_entries(directory, entries, secret):
+            accepted.extend(entries)
+            return
+        if len(entries) == 1:
+            invalid.append(entries[0])
+            return
+        mid = len(entries) // 2
+        self._assess_entries(directory, entries[:mid], secret, accepted, invalid)
+        self._assess_entries(directory, entries[mid:], secret, accepted, invalid)
+
+    def _measure_group(self, jobs):
+        """Measure several sources in one kernel; return per-job outcomes.
+
+        Outcome shape is the same ``(measurements, invalid, unverifiable)`` as
+        ``__call__``. A kernel failure here falls back to one kernel per source
+        in ``measure_jobs``, so the merge can never cost a whole round.
+        """
+        plans, unverifiable = [], [0] * len(jobs)
+        for job_index, job in enumerate(jobs):
+            groups = root_groups(job.graph, job.roots) if self.dedupe else [[root] for root in job.roots]
+            if self.dedupe:
+                self.dedup_saved += len(job.roots) - len(groups)
+            runnable = []
+            for group in groups:
+                if not self.ipv6 and job.graph.v6_bound(group[0]):
+                    unverifiable[job_index] += len(group)
+                    continue
+                runnable.append(group)
+            plans.append(runnable)
+        entries = [(job_index, job, group[0])
+                   for job_index, job in enumerate(jobs) for group in plans[job_index]]
+        accepted, invalid = [], []
+        with tempfile.TemporaryDirectory(prefix="actions-probe-") as temp:
+            directory = private_dir(temp)
+            secret = secrets.token_urlsafe(24)
+            self._assess_entries(directory, entries, secret, accepted, invalid)
+            if accepted:
+                document, lanes = self._export_entries(accepted)
+                ports = unused_ports(len(lanes) + 1)
+                controller = ports[-1]
+                config = kernel_config_document(document, lanes, ports[:-1], controller, secret)
+                private_write(Path(directory) / "config.yaml", canonical(config))
+                if len(accepted) != len(entries) and not self.validate(directory, config):
+                    raise ProbeError("kernel_config_failure")
+                evidence, degraded = self._run_kernel(directory, list(zip(lanes, ports[:-1])), controller, secret, degrade_end=True)
+            else:
+                evidence, degraded = [], False
+        self.merged_groups += 1
+        outcome = {(entry[0], entry[2]): evidence[index] for index, entry in enumerate(accepted)}
+        invalid_keys = {(job_index, root) for job_index, job, root in invalid}
+        results = []
+        for job_index, job in enumerate(jobs):
+            invalid_count = sum(len(group) for group in plans[job_index]
+                                if (job_index, group[0]) in invalid_keys)
+            measured = []
+            for group in plans[job_index]:
+                value = outcome.get((job_index, group[0]))
+                if value is None:
+                    continue
+                item, delay = value
+                if item is None or item is DIRECT_LEAK:
+                    if degraded and (job_index, group[0]) in outcome:
+                        unverifiable[job_index] += len(group)
+                    continue
+                ip, cc, version = item
+                for root in group:
+                    measured.append(Measurement(root, ip, cc, version, delay))
+            results.append((measured, invalid_count, unverifiable[job_index]))
+        return results
+
+    def measure_jobs(self, jobs, batch=0):
+        """Measure prepared sources, merging several into one kernel.
+
+        ``batch`` (or the instance ``kernel_batch``) bounds how many sources
+        share a kernel; 0 means all of them. The first group is the whole
+        round, so 38 kernel starts collapse into one.
+        """
+        if not jobs:
+            return []
+        size = self.kernel_batch or int(batch or 0)
+        chunks = ([list(range(start, min(start + size, len(jobs)))) for start in range(0, len(jobs), size)]
+                  if size > 0 else [list(range(len(jobs)))])
+        outcomes = [None] * len(jobs)
+        for chunk in chunks:
+            if len(chunk) == 1:
+                job = jobs[chunk[0]]
+                outcomes[chunk[0]] = self(job.graph, job.roots)
+                continue
+            try:
+                group = self._measure_group([jobs[index] for index in chunk])
+            except Exception:
+                group = None
+            if group is None:
+                # A shared kernel failed as a whole (start/validation). Fall
+                # back to one kernel per source: attribution and the node
+                # contract matter more than the saved startup time.
+                for index in chunk:
+                    job = jobs[index]
+                    outcomes[index] = self(job.graph, job.roots)
+            else:
+                for index, value in zip(chunk, group):
+                    outcomes[index] = value
+        return outcomes
+
     def __call__(self, graph, roots):
-        accepted, invalid, unverifiable = [], [], 0
-        measurable = []
-        for root in roots:
-            if not self.ipv6 and graph.v6_bound(root):
+        groups = root_groups(graph, roots) if self.dedupe else [[root] for root in roots]
+        if self.dedupe:
+            self.dedup_saved += len(roots) - len(groups)
+        measurable, unverifiable = [], 0
+        for group in groups:
+            if not self.ipv6 and graph.v6_bound(group[0]):
                 # Unreachable FROM THIS HOST, not proven dead. Do not spend a
                 # timeout on it and do not let it count as a dead node.
-                unverifiable += 1
+                unverifiable += len(group)
                 continue
-            measurable.append(root)
+            measurable.append(group)
+        reps = [group[0] for group in measurable]
+        accepted, invalid = [], []
         with tempfile.TemporaryDirectory(prefix="actions-probe-") as temp:
             directory = private_dir(temp)
             secret = secrets.token_urlsafe(24)
             # Unsupported protocols and unusable definitions are isolated by
             # batch bisection; an unhealthy root cannot poison its source.
-            self._assess(directory, graph, measurable, secret, accepted, invalid)
+            self._assess(directory, graph, reps, secret, accepted, invalid)
             if not accepted:
-                return [], len(invalid), unverifiable
+                invalid_set = set(invalid)
+                count = sum(len(group) for group in measurable if group[0] in invalid_set)
+                return [], count, unverifiable
             ports = unused_ports(len(accepted) + 1)
             controller = ports[-1]
             cfg = kernel_config(graph, accepted, ports[:-1], controller, secret)
@@ -881,47 +1217,28 @@ class NativeProbe:
             # per source that buys no new evidence. Only re-check when the batch
             # had to be split (something was rejected), where the combined body
             # has genuinely never been tested.
-            if accepted != measurable and not self.validate(directory, cfg):
+            if len(accepted) != len(reps) and not self.validate(directory, cfg):
                 raise ProbeError("kernel_config_failure")
-            process = None
-            try:
-                process = subprocess.Popen([self.binary, "-d", str(directory), "-f", str(directory / "config.yaml")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                deadline = time.monotonic() + 15
-                while not self.health(process, controller, secret, once=True):
-                    if process.poll() is not None or time.monotonic() > deadline:
-                        raise ProbeError("kernel_start_failure")
-                    time.sleep(0.05)
-
-                lanes = list(zip(accepted, ports[:-1]))
-                # Two passes, not "the same attempt twice". Pass 1 gives every
-                # node a short budget; nothing that needs longer than that for
-                # 1KB is usable anyway. Only the failures spend the full budget
-                # in pass 2, so a transient error still gets its retry while a
-                # dead node stops costing 2 x the full timeout.
-                fast = max(3, min(6, self.timeout // 3))
-                with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
-                    evidence = list(pool.map(lambda lane: self.trace(lane[1], directory, fast), lanes))
-                    retry = [index for index, item in enumerate(evidence) if item is None]
-                    if retry:
-                        for index, item in zip(retry, pool.map(lambda index: self.trace(lanes[index][1], directory), retry)):
-                            evidence[index] = item
-                if not self.health(process, controller, secret):
-                    raise ProbeError("kernel_end_failure")
-                measured = [Measurement(lanes[index][0], *item)
-                            for index, item in enumerate(evidence)
-                            if item is not None and item is not DIRECT_LEAK]
-                return measured, len(invalid), unverifiable
-            except OSError:
-                raise ProbeError("kernel_execution_failure") from None
-            finally:
-                if process is not None:
-                    if process.poll() is None:
-                        process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
+            evidence, degraded = self._run_kernel(directory, list(zip(accepted, ports[:-1])), controller, secret)
+        index_of = {root: index for index, root in enumerate(accepted)}
+        invalid_set = set(invalid)
+        invalid_count = sum(len(group) for group in measurable if group[0] in invalid_set)
+        measured = []
+        for group in measurable:
+            index = index_of.get(group[0])
+            if index is None:
+                continue
+            item, delay = evidence[index]
+            if item is None or item is DIRECT_LEAK:
+                # A kernel that died at the end cannot turn its own silence
+                # into death evidence; the round's positives still stand.
+                if degraded:
+                    unverifiable += len(group)
+                continue
+            ip, cc, version = item
+            for root in group:
+                measured.append(Measurement(root, ip, cc, version, delay))
+        return measured, invalid_count, unverifiable
 
 
 def egress_key(ip):
@@ -935,6 +1252,85 @@ def egress_key(ip):
         return str(ipaddress.ip_address(str(ip)))
     except ValueError:
         return str(ip)
+
+
+def root_groups(graph, roots):
+    """Group interchangeable roots by connection fingerprint.
+
+    Two nodes with the same resolved connection are the SAME dial: the
+    fingerprint excludes only presentation annotations (name, delay, ...).
+    Measuring one and replicating the verdict is exact, not a guess, and a
+    source with 21 duplicate definitions (real data) stops paying 21 dials.
+    Roots whose definition cannot be resolved stay in their own group so
+    validation can reject them individually.
+    """
+    groups, order = {}, []
+    for root in roots:
+        try:
+            key = graph.identity(root)
+        except ProbeError:
+            key = ("unresolved", root)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(root)
+    return [groups[key] for key in order]
+
+
+def landing_class(graph, root, exit_ip):
+    """Whether the measured exit is the node's own ``server`` literal.
+
+    * ``same``    - server is an IP literal and the exit is that address.
+    * ``transit`` - server is an IP literal but the exit differs: a relay,
+                     CDN front or tunnel. Legitimate, annotated, never deleted.
+    * ``unknown`` - server is a hostname, the root has a dialer chain, or the
+                     definition does not expose a literal server.
+    """
+    node = graph.nodes.get(root) if isinstance(getattr(graph, "nodes", None), dict) else None
+    if not isinstance(node, dict):
+        return "unknown"
+    try:
+        if graph.dependency(node):
+            return "unknown"
+    except ProbeError:
+        return "unknown"
+    server = node.get("server")
+    if not isinstance(server, str) or not server:
+        return "unknown"
+    try:
+        ipaddress.ip_address(server)
+    except ValueError:
+        return "unknown"
+    return "same" if egress_key(server) == egress_key(exit_ip) else "transit"
+
+
+def landing_counts(graph, measurements):
+    counts = {"same": 0, "transit": 0, "unknown": 0}
+    for item in measurements:
+        counts[landing_class(graph, item.name, item.ip)] += 1
+    return counts
+
+
+def asn_class_counts(measurements):
+    counts = {}
+    for item in measurements:
+        geo = geo_naming.RESOLVER.entry(item.ip, item.cc)
+        label = geo_naming.classify_asn(geo.get("asn") or 0, geo.get("org") or "")
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _percentile(values, fraction):
+    values = sorted(value for value in values if value > 0)
+    if not values:
+        return 0
+    index = min(len(values) - 1, max(0, int(round(fraction * (len(values) - 1)))))
+    return int(values[index])
+
+
+def delay_stats(measurements):
+    delays = [item.delay_ms for item in measurements if item.delay_ms > 0]
+    return _percentile(delays, 0.5), _percentile(delays, 0.9)
 
 
 def choose_measurements(source, graph, measurements):
@@ -1079,41 +1475,118 @@ def front_health(config, probe):
         return None
 
 
-def measure_source(name, config, front, probe):
-    result = SourceResult(name, input=len(config.get("proxies", [])))
-    try:
-        graph = Graph(dedupe_names(config), front)
-        roots = [item["name"] for item in config["proxies"]]
-        # Nodes the FRONT supplies (the source's own definitions win). A root
-        # that reaches one of them cannot be blamed for its own failures.
-        front_only = set()
-        if front:
-            own = {item.get("name") for item in config.get("proxies", []) if isinstance(item, dict)}
-            front_only = {item.get("name") for item in front.get("proxies", []) if isinstance(item, dict)} - own
-        result.uses_front = graph.front_backed(roots, front_only)
-        measurements, invalid, unverifiable = probe(graph, roots)
-        result.alive = len(measurements)
-        result.measurements = list(measurements)
-        # Roots this host could not dial for lack of IPv6, handed to the helper.
-        if getattr(probe, "ipv6", True) is False:
-            result.v6_roots = [root for root in roots if graph.v6_bound(root)]
-        result.invalid = invalid
-        result.unverifiable = unverifiable
-        result.measured = max(0, len(roots) - invalid - unverifiable)
-        result.unique_egress = len({egress_key(item.ip) for item in measurements})
-        # HTTP/1.1-only exits are kept (some clients and nodes are h1 only) but
-        # counted, so a downgraded middlebox shows up in the manifest instead of
-        # looking identical to a healthy h2 node.
-        result.http1 = sum(1 for item in measurements
-                           if item.http_version and not item.http_version.startswith("2"))
-        for item in measurements:
-            result.countries[item.cc] = result.countries.get(item.cc, 0) + 1
-        # A missing dependency is a per-node validation failure, never stripped.
-        result.content, result.published = source_output(name, graph, measurements)
-    except Exception as exc:
-        result.failed = True
-        result.error = error_code(exc)
+def prepare_source(name, config, front, probe):
+    """Resolve one source's graph and front attribution before any dial."""
+    graph = Graph(dedupe_names(config), front)
+    roots = [item["name"] for item in config["proxies"]]
+    # Nodes the FRONT supplies (the source's own definitions win). A root
+    # that reaches one of them cannot be blamed for its own failures.
+    front_only = set()
+    if front:
+        own = {item.get("name") for item in config.get("proxies", []) if isinstance(item, dict)}
+        front_only = {item.get("name") for item in front.get("proxies", []) if isinstance(item, dict)} - own
+    job = SourceJob(name, config, graph, roots, front_only,
+                    graph.front_backed(roots, front_only))
+    # Roots this host could not dial for lack of IPv6, handed to the helper.
+    if getattr(probe, "ipv6", True) is False:
+        job.v6_roots = [root for root in roots if graph.v6_bound(root)]
+    return job
+
+
+def finish_source(job, measurements, invalid, unverifiable):
+    """Turn a job's raw outcome into a SourceResult and its published body."""
+    result = SourceResult(job.name, input=len(job.config.get("proxies", [])))
+    result.uses_front = job.uses_front
+    result.alive = len(measurements)
+    result.measurements = list(measurements)
+    result.v6_roots = list(job.v6_roots)
+    result.invalid = invalid
+    result.unverifiable = unverifiable
+    result.measured = max(0, len(job.roots) - invalid - unverifiable)
+    result.unique_egress = len({egress_key(item.ip) for item in measurements})
+    # HTTP/1.1-only exits are kept (some clients and nodes are h1 only) but
+    # counted, so a downgraded middlebox shows up in the manifest instead of
+    # looking identical to a healthy h2 node.
+    result.http1 = sum(1 for item in measurements
+                       if item.http_version and not item.http_version.startswith("2"))
+    for item in measurements:
+        result.countries[item.cc] = result.countries.get(item.cc, 0) + 1
+    # Geolocation answered ASN+brand for these exits; prefetching before the
+    # audit fields reuses the same per-IP cache (source_output would fetch it
+    # anyway). Offline (lookup disabled) degrades to "unknown", never raises.
+    _prefetch_geo(measurements)
+    result.asn_class = asn_class_counts(measurements)
+    result.landing = landing_counts(job.graph, measurements)
+    result.delay_median_ms, result.delay_p90_ms = delay_stats(measurements)
+    # A missing dependency is a per-node validation failure, never stripped.
+    result.content, result.published = source_output(job.name, job.graph, measurements)
     return result
+
+
+def failed_source(name, config, exc):
+    result = SourceResult(name, input=len(config.get("proxies", [])) if isinstance(config, dict) else 0)
+    result.failed = True
+    result.error = error_code(exc)
+    return result
+
+
+def measure_source(name, config, front, probe):
+    try:
+        job = prepare_source(name, config, front, probe)
+        measurements, invalid, unverifiable = probe(job.graph, job.roots)
+        return finish_source(job, measurements, invalid, unverifiable)
+    except Exception as exc:
+        return failed_source(name, config, exc)
+
+
+def measure_all(sources, configs, front, probe):
+    """Measure every fetched source, sharing one kernel when the probe can.
+
+    A probe without ``measure_jobs`` (tests, alternative backends) keeps the
+    one-kernel-per-source contract. The merged path is opt-in by capability:
+    any group-level failure is retried per source inside the probe, and a
+    per-source outcome that cannot be produced at all is marked failed so the
+    gates preserve the old artifact instead of inventing death evidence.
+    """
+    order, jobs, failed = [], [], {}
+    for name in sources:
+        if name not in configs:
+            continue
+        order.append(name)
+        try:
+            jobs.append(prepare_source(name, configs[name], front, probe))
+        except Exception as exc:
+            failed[name] = failed_source(name, configs[name], exc)
+    outcomes = None
+    if len(jobs) > 1 and hasattr(probe, "measure_jobs"):
+        try:
+            outcomes = probe.measure_jobs(jobs, getattr(probe, "kernel_batch", 0))
+        except Exception:
+            outcomes = None
+    results = {}
+    if outcomes is not None and len(outcomes) == len(jobs):
+        for job, outcome in zip(jobs, outcomes):
+            if outcome is None:
+                try:
+                    outcome = probe(job.graph, job.roots)
+                except Exception:
+                    outcome = None
+            if outcome is None:
+                results[job.name] = failed_source(job.name, job.config,
+                                                  ProbeError("kernel_execution_failure"))
+                continue
+            try:
+                results[job.name] = finish_source(job, *outcome)
+            except Exception as exc:
+                results[job.name] = failed_source(job.name, job.config, exc)
+    else:
+        for job in jobs:
+            try:
+                results[job.name] = finish_source(job, *probe(job.graph, job.roots))
+            except Exception as exc:
+                results[job.name] = failed_source(job.name, job.config, exc)
+    results.update(failed)
+    return [results[name] for name in order]
 
 
 def merge_sources(contents, corrupt=None):
@@ -1497,6 +1970,9 @@ def plan_updates(results, old):
                 "unverifiable": result.unverifiable, "bad_streak": streak,
                 "unproven_rounds": unproven_rounds, "http1": result.http1,
                 "uses_front": result.uses_front,
+                "delay_median_ms": result.delay_median_ms,
+                "delay_p90_ms": result.delay_p90_ms,
+                "landing": result.landing, "asn_class": result.asn_class,
             }
             continue
         if accept:
@@ -1510,6 +1986,9 @@ def plan_updates(results, old):
             "unverifiable": result.unverifiable, "bad_streak": streak,
             "unproven_rounds": unproven_rounds, "http1": result.http1,
             "uses_front": result.uses_front,
+            "delay_median_ms": result.delay_median_ms,
+            "delay_p90_ms": result.delay_p90_ms,
+            "landing": result.landing, "asn_class": result.asn_class,
         }
     # Freeze names for the sources published this round, then for the merged
     # projection (which also covers retained artifacts rendered by an older
@@ -1537,6 +2016,8 @@ def plan_updates(results, old):
                 "guard": "old_content_invalid", "corrupt": True,
                 "measured": 0, "invalid": 0, "unverifiable": 0,
                 "bad_streak": 0, "unproven_rounds": 0, "uses_front": False,
+                "delay_median_ms": 0, "delay_p90_ms": 0,
+                "landing": {}, "asn_class": {},
             }
     if not effective:
         # Nothing usable remains. Every source proven dead means the merged body
@@ -1705,7 +2186,10 @@ def result_reports(results, files=None):
                         "unique_egress": item.unique_egress, "countries": item.countries,
                         "measured": item.measured, "unverifiable": item.unverifiable,
                         "bad_streak": state.get("bad_streak", 0),
-                        "http1": item.http1, "uses_front": item.uses_front})
+                        "http1": item.http1, "uses_front": item.uses_front,
+                        "delay_median_ms": item.delay_median_ms,
+                        "delay_p90_ms": item.delay_p90_ms,
+                        "landing": item.landing, "asn_class": item.asn_class})
     return reports
 
 
@@ -1859,7 +2343,17 @@ def run(env=None, transport=None, probe=None):
                 raise ProbeError("kernel_missing")
             if not shutil.which("curl"):
                 raise ProbeError("curl_missing")
-            probe = NativeProbe(binary, env.get("PROBE_CONCURRENCY", 8), env.get("PROBE_TIMEOUT", 15), ipv6=override)
+            probe = NativeProbe(
+                binary, env.get("PROBE_CONCURRENCY", 8), env.get("PROBE_TIMEOUT", 15),
+                ipv6=override,
+                # A dead node costs one 2s controller call instead of a short
+                # trace plus a full retry; survivors still get a curl trace for
+                # exit IP / TLS evidence, so the prefilter never replaces it.
+                delay_ms=(env_int(env.get("PROBE_DELAY_TIMEOUT_MS", 2000), 2000, 0, 30000)
+                          if env_flag(env.get("PROBE_DELAY_PREFILTER"), True) else 0),
+                kernel_batch=env_int(env.get("PROBE_KERNEL_BATCH", 0), 0, 0, 100000),
+                dedupe=env_flag(env.get("PROBE_DEDUPE"), True),
+            )
         summary["phase"] = "sources"
         sources = store.sources()
         if requested:
@@ -1930,9 +2424,11 @@ def run(env=None, transport=None, probe=None):
                 helper_future = helper_pool.submit(request_v6, helper_jobs, env)
         summary["phase"] = "measure"
         mark = time.monotonic()
-        for name in sources:
-            if name in configs:
-                results.append(measure_source(name, configs[name], front, probe))
+        # One shared kernel for the whole round by default: 38 kernel starts
+        # were 38 rounds of fixed startup/validation with the pool idle. The
+        # probe falls back to one kernel per source if a merged group fails, so
+        # a single bad config cannot lose the round.
+        results.extend(measure_all(sources, configs, front, probe))
         # The front is fetched for its definitions but is usually not a source
         # of its own, so nobody measured it and ``front_alive`` stayed None --
         # which froze every front-backed source's streak at zero forever. One
@@ -1974,6 +2470,12 @@ def run(env=None, transport=None, probe=None):
         # Traces that came back with the runner's own address: the node did not
         # carry them. Should be 0; anything else is a leak worth investigating.
         summary["direct_leak"] = getattr(probe, "suppressed", 0)
+        # Work the optimisations removed: duplicate definitions collapsed
+        # before dialling, dead nodes rejected by the kernel delay probe, and
+        # source groups that shared one kernel. Counts only; no node names.
+        summary["dedup_saved"] = getattr(probe, "dedup_saved", 0)
+        summary["prefiltered"] = getattr(probe, "prefiltered", 0)
+        summary["merged_kernels"] = getattr(probe, "merged_groups", 0)
         if requested:
             summary["results"] = result_reports(results)
         summary["phase"] = "checkpoint"

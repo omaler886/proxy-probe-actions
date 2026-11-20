@@ -64,6 +64,19 @@ reservation and would receive a new name if they returned.
 HTTP/1.1 instead of HTTP/2. It is an audit signal for a downgraded hop, never a
 deletion rule.
 
+Three audit fields are recorded per source and never affect selection:
+`delay_median_ms`/`delay_p90_ms` (kernel `/delay` round trip; 0 = no evidence),
+`landing` (`same`/`transit`/`unknown`, comparing the measured exit with the
+node's `server` literal — a relay or CDN front is legitimate, so it is
+annotated only), and `asn_class` (`cdn`/`datacenter`/`residential`/`mobile`/
+`unknown`, from the egress ASN).
+
+Measurement itself is de-duplicated twice: identical connection definitions
+inside one source share a single dial (the verdict is replicated to every
+duplicate label), and independent sources share one kernel instead of one
+kernel per source. A shared kernel that fails falls back to one kernel per
+source automatically.
+
 Before measuring, the probe records the runner's own egress address with one
 direct trace. A node that reports that address never carried the request (a
 configuration bug or a silent DIRECT fallback); such a trace is counted in

@@ -86,6 +86,64 @@ ASN_SHORT = {
     9381: "HKBN", 9908: "i-CABLE", 3786: "HGC", 10103: "HKBN",
 }
 
+#: Egress quality class per ASN. This is an AUDIT annotation, not a filter:
+#: a datacenter exit is a legitimate proxy, it is just not a residential one.
+#: Categories are deliberately few and mutually exclusive.
+#:
+#:   cdn          - anycast/edge networks (Cloudflare, Fastly, Akamai)
+#:   datacenter   - hosting/cloud/VPS/transit providers (bulk egress)
+#:   residential  - consumer ISPs (broadband, cable, DSL, fiber)
+#:   mobile       - mobile carriers (cellular egress, CGNAT-prone)
+#:   unknown      - no ASN evidence, or an ASN we do not recognise
+CDN_ASNS = {13335, 209242, 395747, 54113, 20940, 16625, 32787}
+DATACENTER_ASNS = {
+    16509, 15169, 8075, 24940, 14061, 16276, 12876, 20473, 63949, 51167,
+    197540, 9009, 212238, 60068, 30088, 63023, 47172, 49453, 45102, 37963,
+    132203, 45090, 55990, 136907, 40065, 53667, 40676, 29802, 46844,
+    20454, 62874, 131642, 215439, 55933, 6939, 174, 54600, 2914, 135377,
+}
+RESIDENTIAL_ASNS = {
+    4760, 3462, 17539, 9269, 9500, 9381, 10103, 4515, 3491, 9925, 9908, 3786,
+    7018, 20115, 11426, 6128, 9321, 4134, 4812, 23724, 4837, 4808, 17816,
+    9929,
+}
+MOBILE_ASNS = {9808, 58466, 56040, 56041, 24400}
+
+_CLASS_KEYWORDS = (
+    ("cdn", ("cdn", "cloudflare", "akamai", "fastly", "edgecast")),
+    ("mobile", ("mobile", "cellular", "wireless")),
+    ("datacenter", ("cloud", "hosting", "host", "server", "datacenter",
+                    "data center", "vps", "colo", "dedicated", "transit")),
+    ("residential", ("broadband", "telecom", "communications", "cable",
+                     "fiber", "dsl", "isp", "network")),
+)
+
+
+def classify_asn(asn, org=""):
+    """Egress class from an ASN, with a conservative org-name fallback.
+
+    Unknown is a first-class answer: guessing "residential" from an unrelated
+    registry string would turn a useful audit field into noise.
+    """
+    try:
+        number = int(asn or 0)
+    except (TypeError, ValueError):
+        number = 0
+    if number in CDN_ASNS:
+        return "cdn"
+    if number in MOBILE_ASNS:
+        return "mobile"
+    if number in DATACENTER_ASNS:
+        return "datacenter"
+    if number in RESIDENTIAL_ASNS:
+        return "residential"
+    text = (org or "").lower()
+    for label, words in _CLASS_KEYWORDS:
+        if any(word in text for word in words):
+            return label
+    return "unknown"
+
+
 CITY_ZH = {
     "Hong Kong": "香港", "Taipei": "台北", "New Taipei": "新北", "Tokyo": "东京",
     "Osaka": "大阪", "Seoul": "首尔", "Incheon": "仁川", "Busan": "釜山",

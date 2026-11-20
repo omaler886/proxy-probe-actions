@@ -1436,5 +1436,202 @@ class SourceSecretsTests(unittest.TestCase):
             self.assertNotIn("abc123", json.dumps(summary))
 
 
+class AuditFieldTests(unittest.TestCase):
+    def test_asn_class_covers_known_and_heuristic(self):
+        self.assertEqual(p.geo_naming.classify_asn(24940), "datacenter")
+        self.assertEqual(p.geo_naming.classify_asn(13335), "cdn")
+        self.assertEqual(p.geo_naming.classify_asn(4760), "residential")
+        self.assertEqual(p.geo_naming.classify_asn(9808), "mobile")
+        self.assertEqual(p.geo_naming.classify_asn(64500, "Some Cloud Hosting Ltd"), "datacenter")
+        self.assertEqual(p.geo_naming.classify_asn(64500, "Korea Broadband"), "residential")
+        self.assertEqual(p.geo_naming.classify_asn(64500, "Mobile Wireless"), "mobile")
+        self.assertEqual(p.geo_naming.classify_asn(0, ""), "unknown")
+
+    def test_landing_compares_only_literal_servers_without_a_dialer(self):
+        graph = p.Graph({"proxies": [
+            node("same", server="1.2.3.4"),
+            node("transit", server="5.6.7.8"),
+            node("hostname", server="edge.example"),
+            node("chain", server="9.9.9.9", **{"dialer-proxy": "same"}),
+        ]})
+        self.assertEqual(p.landing_class(graph, "same", "1.2.3.4"), "same")
+        self.assertEqual(p.landing_class(graph, "transit", "1.2.3.4"), "transit")
+        self.assertEqual(p.landing_class(graph, "hostname", "1.2.3.4"), "unknown")
+        self.assertEqual(p.landing_class(graph, "chain", "1.2.3.4"), "unknown")
+        self.assertEqual(
+            p.landing_counts(graph, [p.Measurement("same", "1.2.3.4", "US"),
+                                     p.Measurement("transit", "1.2.3.4", "US")]),
+            {"same": 1, "transit": 1, "unknown": 0},
+        )
+
+    def test_manifest_carries_delay_landing_and_asn_class(self):
+        result = candidate(count=2)
+        result.delay_median_ms, result.delay_p90_ms = 120, 200
+        result.landing = {"same": 1, "transit": 1, "unknown": 0}
+        result.asn_class = {"datacenter": 2}
+        files = p.plan_updates([result], {})
+        entry = json.loads(files["manifest.json"])["sources"][p.source_file("airport")]
+        self.assertEqual((entry["delay_median_ms"], entry["delay_p90_ms"]), (120, 200))
+        self.assertEqual(entry["landing"], {"same": 1, "transit": 1, "unknown": 0})
+        self.assertEqual(entry["asn_class"], {"datacenter": 2})
+
+
+class MeasurementDedupeTests(unittest.TestCase):
+    def test_identical_connections_are_dialled_once_and_replicated(self):
+        """Same resolved connection = same dial; the verdict is repeated."""
+        graph = p.Graph({"proxies": [node("a", server="1.2.3.4"),
+                                     node("b", server="1.2.3.4")]})
+        probe = p.NativeProbe("mihomo", dedupe=True)
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(probe, "validate", return_value=True), \
+             mock.patch.object(probe, "health", return_value=True), \
+             mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US", "2")) as trace, \
+             mock.patch.object(p.subprocess, "Popen", return_value=process):
+            measured, invalid, unverifiable = probe(graph, ["a", "b"])
+        self.assertEqual(trace.call_count, 1)
+        self.assertEqual(sorted(item.name for item in measured), ["a", "b"])
+        self.assertEqual((invalid, unverifiable), (0, 0))
+        self.assertEqual(probe.dedup_saved, 1)
+
+
+class DelayPrefilterTests(unittest.TestCase):
+    def _process(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        return process
+
+    def test_dead_node_costs_one_delay_call_and_is_not_traced(self):
+        graph = p.Graph({"proxies": [node("dead", server="1.1.1.1"),
+                                     node("live", server="2.2.2.2")]})
+        probe = p.NativeProbe("mihomo", delay_ms=2000)
+        process = self._process()
+
+        def delay(controller, secret, name):
+            return (False, 0, False) if name == "dead" else (True, 321, False)
+
+        with mock.patch.object(probe, "validate", return_value=True), \
+             mock.patch.object(probe, "health", return_value=True), \
+             mock.patch.object(probe, "delay_probe", side_effect=delay), \
+             mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US", "2")) as trace, \
+             mock.patch.object(p.subprocess, "Popen", return_value=process):
+            measured, invalid, unverifiable = probe(graph, ["dead", "live"])
+        self.assertEqual([item.name for item in measured], ["live"])
+        self.assertEqual(measured[0].delay_ms, 321)
+        self.assertEqual(probe.prefiltered, 1)
+        self.assertEqual(trace.call_count, 1)
+
+    def test_controller_error_falls_back_to_curl(self):
+        """An API failure must never manufacture dead nodes."""
+        graph = p.Graph({"proxies": [node("a", server="1.1.1.1"),
+                                     node("b", server="2.2.2.2")]})
+        probe = p.NativeProbe("mihomo", delay_ms=2000)
+        process = self._process()
+        with mock.patch.object(probe, "validate", return_value=True), \
+             mock.patch.object(probe, "health", return_value=True), \
+             mock.patch.object(probe, "delay_probe", return_value=(False, 0, True)), \
+             mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US", "2")) as trace, \
+             mock.patch.object(p.subprocess, "Popen", return_value=process):
+            measured, invalid, unverifiable = probe(graph, ["a", "b"])
+        self.assertEqual(len(measured), 2)
+        self.assertEqual(probe.prefiltered, 0)
+        self.assertEqual(trace.call_count, 2)
+        self.assertTrue(all(item.delay_ms == 0 for item in measured))
+
+
+class MergedKernelTests(unittest.TestCase):
+    @staticmethod
+    def _job(name, root, server):
+        config = {"proxies": [node(root, server=server)]}
+        return p.SourceJob(name, config, p.Graph(config), [root], set(), False)
+
+    def _process(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        return process
+
+    def test_two_sources_share_one_kernel_and_keep_attribution(self):
+        jobs = [self._job("alpha", "a", "1.1.1.1"),
+                self._job("beta", "b", "2.2.2.2")]
+        probe = p.NativeProbe("mihomo")
+        process = self._process()
+        written = []
+        with mock.patch.object(probe, "validate", return_value=True), \
+             mock.patch.object(probe, "health", return_value=True), \
+             mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US", "2")) as trace, \
+             mock.patch.object(p, "private_write", side_effect=lambda path, content: written.append(content)), \
+             mock.patch.object(p.subprocess, "Popen", return_value=process) as popen:
+            outcomes = probe.measure_jobs(jobs)
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual(trace.call_count, 2)
+        self.assertEqual(probe.merged_groups, 1)
+        self.assertEqual([item.name for item in outcomes[0][0]], ["a"])
+        self.assertEqual([item.name for item in outcomes[1][0]], ["b"])
+        config = yaml.safe_load(written[-1])
+        lanes = [listener["proxy"] for listener in config["listeners"]]
+        self.assertEqual(len(lanes), 2)
+        self.assertTrue(all(name.startswith(("s0-n", "s1-n")) for name in lanes))
+
+    def test_a_bad_root_is_attributed_to_its_own_source(self):
+        jobs = [self._job("alpha", "a", "1.1.1.1"),
+                self._job("beta", "b", "bad.invalid")]
+
+        def validate(directory, cfg):
+            return all(proxy.get("server") != "bad.invalid" for proxy in cfg["proxies"])
+
+        probe = p.NativeProbe("mihomo")
+        process = self._process()
+        with mock.patch.object(probe, "validate", side_effect=validate), \
+             mock.patch.object(probe, "health", return_value=True), \
+             mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US", "2")), \
+             mock.patch.object(p.subprocess, "Popen", return_value=process) as popen:
+            outcomes = probe.measure_jobs(jobs)
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual([outcome[1] for outcome in outcomes], [0, 1])
+        self.assertEqual(len(outcomes[0][0]), 1)
+
+    def test_group_failure_falls_back_to_one_kernel_per_source(self):
+        jobs = [self._job("alpha", "a", "1.1.1.1"),
+                self._job("beta", "b", "2.2.2.2")]
+        calls = []
+
+        class FallbackProbe(p.NativeProbe):
+            def __call__(self, graph, roots):
+                calls.append(list(roots))
+                return ([p.Measurement(roots[0], "8.8.8.8", "US")], 0, 0)
+
+        probe = FallbackProbe("mihomo")
+        with mock.patch.object(probe, "_measure_group", side_effect=p.ProbeError("kernel_start_failure")):
+            outcomes = probe.measure_jobs(jobs)
+        self.assertEqual(calls, [["a"], ["b"]])
+        self.assertEqual([len(outcome[0]) for outcome in outcomes], [1, 1])
+
+
+class MeasureAllTests(unittest.TestCase):
+    def test_a_merged_capable_probe_measures_every_source_in_one_call(self):
+        configs = {
+            "alpha": {"proxies": [node("a", server="1.1.1.1")]},
+            "beta": {"proxies": [node("b", server="2.2.2.2")]},
+        }
+
+        class Probe:
+            ipv6 = True
+            kernel_batch = 0
+            merged = 0
+
+            def measure_jobs(self, jobs, batch=0):
+                self.merged = len(jobs)
+                return [([p.Measurement(job.roots[0], "8.8.8.8", "US")], 0, 0) for job in jobs]
+
+            def __call__(self, graph, roots):
+                raise AssertionError("merged path must not fall back")
+
+        probe = Probe()
+        results = p.measure_all(["alpha", "beta"], configs, None, probe)
+        self.assertEqual(probe.merged, 2)
+        self.assertEqual([item.name for item in results], ["alpha", "beta"])
+        self.assertTrue(all(item.alive == 1 for item in results))
+
+
 if __name__ == "__main__":
     unittest.main()
