@@ -762,8 +762,17 @@ class NativeProbe:
         """Return whether a root's existing IPv6 gate lacks its required host transport."""
         if not graph.v6_bound(root):
             return False
-        adapter = str(graph.nodes.get(root, {}).get("type", "")).lower()
-        return not self.ipv6 or (adapter in IPV6_UDP_ADAPTERS and not self.ipv6_udp)
+        if not self.ipv6:
+            return True
+        if self.ipv6_udp:
+            return False
+        try:
+            nodes, _ = graph.closure([root])
+        except ProbeError:
+            return False  # Kernel validation owns attribution for invalid definitions.
+        needs_udp = any(str(graph.nodes[name].get("type", "")).lower() in IPV6_UDP_ADAPTERS
+                        for name in nodes)
+        return needs_udp and not self.ipv6_udp
 
     def validate(self, directory, cfg):
         path = Path(directory) / "config.yaml"

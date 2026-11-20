@@ -11,7 +11,7 @@ accounts. Complete the following configuration before enabling the new workflow.
 | Original Sub-Store sources | Existing Sub-Store, GET over HTTPS | Existing source credentials |
 | Per-source YAML, manifest and merged policy baseline | One JSON bundle in a dedicated private GitHub repository | Repository Contents read token |
 | Sanitized merged connection YAML | A separate unlisted Gist with one file | Possession of its URL |
-| Helper configuration | SSH stdin and temporary 0700/0600 working files | Dedicated, pinned non-root SSH account |
+| IPv6 node configurations | Temporary 0700/0600 files on the same runner | Local measurement process only |
 
 A usable subscription contains passwords/UUIDs and is itself sensitive.
 Sanitizing removes source annotations and internal source namespaces; it does
@@ -32,9 +32,9 @@ service of your choice. This repository does not deploy a public HTTP service.
    `proxies: []` as its initial content. Set `GIST_ID` to this new locator only
    after the old baseline has been migrated. Extra files, including a README,
    are rejected with `delivery_gist_mixed`.
-4. Configure a non-root helper as described in [IPV6_HELPER.md](IPV6_HELPER.md),
-   or leave `V6_HELPER_HOST` empty to retain an IPv4-only observer. Without a
-   helper, unjudgeable IPv6 nodes continue to be preserved.
+4. IPv6 setup now runs directly on the Actions runner using native connectivity
+   or WARP, as described in [RUNNER_IPV6.md](RUNNER_IPV6.md). No helper host or
+   SSH credentials are needed. A failed IPv6 setup preserves unjudgeable nodes.
 5. Ensure `SUBSTORE_BASE` and every source override URL use HTTPS and trusted
    certificates. HTTP, URL userinfo and URL fragments are now rejected.
 
@@ -88,7 +88,7 @@ commit. Gist writes still require a single serialized workflow writer.
 
 ## Concurrency and performance evidence
 
-Defaults: global ceiling 64 on the runner, 48 on the helper, and 8 simultaneous
+Defaults: global ceiling 64 on the runner and 8 simultaneous
 dials per first-entry host. Small rounds use a smaller pool. Entry hosts behind
 `dialer-proxy` share a limit even when the final nodes have different servers;
 different ports on the same host also share it. DNS aliases and shared egresses
@@ -104,7 +104,7 @@ names stay frozen.
 The offline tests verify concurrency limits, exception recovery and publication
 boundaries. They do not benchmark live node throughput. Before raising a ceiling,
 compare the same authorized source set at 24/48/64 workers over multiple rounds
-on the same host; use `measure_s`, `helper_wait_s`, alive counts and error counts.
+on the same host; use `measure_s`, setup time, alive counts and error counts.
 Keep timeout, entry cap, source set and kernel version constant. Use local-only
 output directories for these experiments and omit all publication credentials;
 never compare runs that write the production policy counters. There is no

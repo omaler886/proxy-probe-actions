@@ -1363,6 +1363,15 @@ class IPv6TransportTests(unittest.TestCase):
             self.assertEqual(state["bad_streak"], 0)
             self.assertEqual(old[p.source_file("airport")], candidate(count=4).content)
 
+    def test_udp_front_dependency_also_requires_ipv6_udp(self):
+        """A TCP target behind an IPv6 UDP front cannot blame the target for a UDP outage."""
+        self.checker.return_value = self.report(udp_ok=False)
+        config = {"proxies": [node("front", proto="tuic", server="2606:4700::1111"),
+                               node("target", **{"dialer-proxy": "front"})]}
+        graph = p.Graph(config)
+        probe = p.NativeProbe("mihomo")
+        self.assertTrue(probe._ipv6_unverifiable(graph, "target"))
+
     def test_udp_loss_protects_udp_failures_and_keeps_tcp_failure_evidence(self):
         """A UDP outage leaves working UDP measurements and ordinary TCP failures intact."""
         self.checker.side_effect = [self.report(), self.report(udp_ok=False)]

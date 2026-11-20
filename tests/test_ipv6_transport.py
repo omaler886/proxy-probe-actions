@@ -1,5 +1,6 @@
 """Offline checks for verified IPv6 connectivity and local-only node smoke."""
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -107,6 +108,47 @@ class Ipv6ConnectivityTests(unittest.TestCase):
                 "sys.stdout", new_callable=io.StringIO) as output:
             self.assertEqual(network.main(), 1)
         self.assertEqual(json.loads(output.getvalue()), {"ok": False})
+
+
+class ReadOnlySmokeTests(unittest.TestCase):
+    """Protocol diversity and dependency preservation in the real-node smoke job."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Load the standalone smoke entry point without running it."""
+        path = Path(__file__).resolve().parents[1] / "tools" / "verify_runner_ipv6.py"
+        spec = importlib.util.spec_from_file_location("runner_ipv6_smoke_test", path)
+        cls.tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.tool)
+
+    def test_selection_does_not_fill_the_sample_with_only_first_protocol(self):
+        """Both TCP and UDP protocol candidates must survive a small sample budget."""
+        graph = self.tool.probe.Graph({"proxies": [
+            {"name": name, "type": protocol, "server": "2606:4700::1111", "port": 443}
+            for name, protocol in (("a", "vless"), ("b", "vless"), ("c", "vless"), ("d", "tuic"))]})
+        jobs = self.tool.select_jobs({"vless": [("s", graph, name) for name in ("a", "b", "c")],
+                                      "tuic": [("s", graph, "d")]}, 2)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(set(jobs[0].roots), {"a", "d"})
+
+    def test_selected_node_retains_required_front_but_omits_unrelated_nodes(self):
+        """A real-node smoke uses the same complete chain as production measurement."""
+        graph = self.tool.probe.Graph({"proxies": [
+            {"name": "front", "type": "ss", "server": "front.invalid", "port": 443},
+            {"name": "target", "type": "vless", "server": "2606:4700::1111", "port": 443,
+             "dialer-proxy": "front"},
+            {"name": "unused", "type": "ss", "server": "unused.invalid", "port": 443}]})
+        jobs = self.tool.select_jobs({"vless": [("s", graph, "target")]}, 12)
+        self.assertEqual({node["name"] for node in jobs[0].config["proxies"]}, {"target", "front"})
+
+    def test_missing_transport_avoids_subscription_fetch_and_any_publishing(self):
+        """A failed WARP/network check must fail the smoke before accessing subscriptions."""
+        with mock.patch.object(self.tool, "check_ipv6_connectivity", return_value={"ok": False}), mock.patch.object(
+                self.tool.probe, "SubStore") as store:
+            code, report = self.tool.verify({"SUBSTORE_BASE": "https://fixture.invalid"})
+        self.assertEqual(code, 2)
+        self.assertEqual(report["error"], "runner_ipv6_unverified")
+        store.assert_not_called()
 
 
 if __name__ == "__main__":

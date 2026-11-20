@@ -65,7 +65,7 @@
 
 - secret 值绝不写进本仓库、issue、日志或聊天记录；GitHub 对 Actions 日志里的
   secret 做精确匹配打码，但不要依赖它做变换（URL 编码/截断都会绕过打码）。
-- `SOURCE_SECRETS_JSON` 本身只经环境变量进入主脚本内存，不传给 mihomo/curl/SSH
+- `SOURCE_SECRETS_JSON` 本身只经环境变量进入主脚本内存，不传给 mihomo/curl
   子进程环境，不进 artifact 或 Gist。拉取结果中的节点连接凭据仍会出现在
   私有临时配置、私有状态及合并订阅中，连接所需的凭据不能靠脱敏去掉。
 - 若某个源的凭据泄露：直接更新 secret 值（轮换），旧值即刻失效于本管线。

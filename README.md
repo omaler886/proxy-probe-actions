@@ -12,7 +12,7 @@ must be shared only with trusted recipients.
 
 1. Read original subscriptions from Sub-Store over **HTTPS** (`GET` only). HTTP, embedded URL credentials, fragments and cross-origin redirects are rejected. Exclude generated `probe-*`, `chain-*`, `rust-*`, `gist-*`, `测活-DMIT`, and `官方可用` sources to avoid feedback loops.
 2. Use native mihomo on the GitHub-hosted Ubuntu runner. Validate each node with its full dialer dependency closure; never strip a required dialer into a direct connection.
-3. Request `https://www.cloudflare.com/cdn-cgi/trace` through a node-specific loopback HTTP listener, with certificate validation and no direct fallback. Only a successful trace with a global `ip` and valid `loc` counts as alive. Every node gets a short first pass (a 1KB trace that needs longer is unusable); only failures spend the full timeout in a second pass, so a dead node costs fast+full instead of full+full. IPv6-bound nodes are settled by the helper host in parallel with the runner's own round.
+3. Request `https://www.cloudflare.com/cdn-cgi/trace` through a node-specific loopback HTTP listener, with certificate validation and no direct fallback. Only a successful trace with a global `ip` and valid `loc` counts as alive. Every node gets a short first pass; only failures spend the full timeout in a second pass. IPv6 nodes run on the **same runner**, using verified native IPv6 or a local WARP tunnel. No SSH helper or remote node configuration transfer is used.
 4. Rename from country/ASN brand and an optional local geo cache. Measurement never queries online geolocation providers. Timing is not embedded in names.
 5. Within each source, group successful nodes by actual trace exit IP. Prefer Shadowsocks (`ss`), then a stable connection fingerprint. Every distinct exit is retained regardless of protocol. This selection favors a stable representative, not necessarily the lowest-latency protocol.
 6. Commit source YAMLs, the merged YAML and `manifest.json` together as one JSON bundle in a **private** GitHub repository. Contents API blob SHA checks prevent stale state from overwriting a concurrent update. Retry IDs prevent an ambiguous write response from consuming two grace rounds.
@@ -49,7 +49,7 @@ noise.
 
 A held source keeps its previous body until the missing nodes can be judged
 again. That is deliberately conservative: a source with an unmeasurable member
-will not shrink while the host (or the helper) cannot judge it, because the
+will not shrink while the runner cannot judge it, because the
 alternative is deleting a node for a limitation of the observer.
 
 
@@ -124,13 +124,28 @@ configuration bug or a silent DIRECT fallback); such a trace is counted in
 
 Actions → **All subscription probes** → Run workflow. The optional `sources_json` input accepts a JSON list (for example `["ikunkun","pokenmen","健康中心","prologue","233pio","saki","glados"]`); duplicates are removed. An empty input keeps the full-source schedule. Scheduled every six hours at minute 23 (UTC), with one run at a time. GitHub scheduled execution is best effort and may be delayed.
 
-**IPv6 is a host capability, not a node property.** GitHub-hosted runners have
-no global IPv6 route, so a node whose server address (or whose front's address)
-is an IPv6 literal cannot be dialled there. Such a node is reported as
-`unverifiable`, never as dead, and the round summary records the host verdict in
-`ipv6`. A v6-bound node is only measured when the probe runs on an IPv6-capable
-host. Runner location/reachability is also different from HK/CN/LXC; a
-location-restricted node may fail from GitHub even when reachable elsewhere.
+Enable `dry_run` for a read-only full measurement: publishing tokens are omitted,
+no Gist/private state requests are made, and results stay in private temporary
+runner files. Production failure counters are not advanced by a dry run.
+
+**IPv6 is a measured host capability, not a node property.** The workflow first
+checks two independent public IPv6 HTTPS endpoints with verified certificates
+and literal IPv6 routing. If native connectivity is absent, it installs the
+pinned official Cloudflare WARP client on the ephemeral runner. IPv4 is excluded
+from the tunnel and its public egress must remain unchanged. WireGuard is tried
+first, with MASQUE as a fallback. WARP is disconnected during job cleanup.
+
+UDP capability is checked separately using real IPv6 DNS datagrams. Without it,
+IPv6 UDP adapters (including Hysteria2/TUIC/WireGuard) remain `unverifiable`.
+The same checks run after measurement: if the transport degrades, failed IPv6
+attempts remain unjudged while successful node traces are retained. The summary
+reports aggregate evidence in `ipv6_transport`. A route lookup or `warp=on`
+alone never enables node death evidence. See [runner IPv6 setup](docs/RUNNER_IPV6.md).
+
+Runner location/reachability is different from HK/CN/LXC; a location-restricted
+node may still fail from this observer. Testing an IPv6 **entry** does not imply
+the measured node has an IPv6 **exit**. Its Cloudflare trace can legitimately
+return an IPv4 egress.
 
 ## Secrets
 
@@ -149,11 +164,9 @@ local-only runs into the private output directory.
 
 Gist `public: false` means **unlisted**, not access-controlled/private: holders of the raw URL can read the credentials in a subscription. The source code repository itself is public, so the Gist id must never be rendered into step summaries, logs, or committed files. Do not distribute raw URLs publicly.
 
-The optional IPv6 helper must use an explicit non-root account (workflow default
-`probe-v6`), a dedicated private key and pinned `known_hosts`. Missing pinning is
-an error; there is no `accept-new` fallback. Only target dependency closures
-are sent over SSH. The binary path is fixed on the worker; jobs cannot select
-an executable. See [helper setup](docs/IPV6_HELPER.md).
+IPv6 requires no helper host, SSH key or extra subscription secrets. Legacy
+`V6_HELPER_*` secrets are unused. Native/WARP network setup receives no publishing
+or subscription credentials. Only the local measurement step reads subscriptions.
 
 ## Adding a subscription source
 
