@@ -256,9 +256,8 @@ def audit(artifacts):
     report["totals"]["hash_suffix_merged"] = sum(
         1 for name in merged_names if HASH_SUFFIX.search(str(name)))
 
-    # Health verdict: a high Unknown ratio means the publisher's geolocation
-    # did not run (PROBE_GEO_LOOKUP=0 or the monthly ASN dump failed), which is
-    # a config failure rather than a naming-style nit. Surface it explicitly.
+    # Missing local ASN/cache coverage is visible as naming degradation;
+    # measurement deliberately makes no per-exit online geolocation requests.
     total_merged = len(merged_names) or 1
     unknown_merged = sum(1 for name in merged_names
                          if UNKNOWN_BRAND.search(str(name)))
@@ -274,7 +273,7 @@ def audit(artifacts):
         "unknown_merged": unknown_merged,
         "unknown_ratio": round(ratio, 4),
         "reason": ("" if healthy else
-                   "geolocation lookup likely disabled (PROBE_GEO_LOOKUP / ASN dump)"
+                    "local ASN/geolocation cache coverage unavailable or incomplete"
                    if ratio > 0.05 else "generic brand used as provider name"),
     }
     return report

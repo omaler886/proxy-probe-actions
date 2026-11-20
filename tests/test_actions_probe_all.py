@@ -78,6 +78,41 @@ class FakeGist:
         return json.dumps({"public": self.public, "files": files}).encode(), {"ETag": '"version"'}
 
 
+class FixtureStateStore:
+    """Adapt the historical in-memory Gist fixture to the private store contract.
+
+    Only tests have this writer: production's legacy Gist interface is read-only.
+    Keeping this adapter preserves all existing failure-policy regression cases.
+    """
+
+    def __init__(self, gist_id, token, transport):
+        """Retain the legacy reader and fixture transport; never contact a network."""
+        self.reader = p.LegacyGistReader(gist_id, token, transport)
+        self.old = {}
+
+    def current(self):
+        """Read a simulated state snapshot and remember it for diff assertions."""
+        self.old, version = self.reader.current()
+        return self.old, version
+
+    def save(self, files, version):
+        """Commit changed fixture files together, including any policy deletions."""
+        updates = {name: {"content": text} for name, text in files.items()
+                   if text != self.old.get(name)}
+        updates.update({name: None for name in self.old if name not in files})
+        headers = dict(self.reader.headers, **{"Content-Type": "application/json"})
+        self.reader.transport("PATCH", self.reader.url, headers,
+                              p.json_text({"files": updates}).encode())
+
+
+class FixturePublisher(p.StatePublisher):
+    """Use the real policy publisher with the historical offline fixture store."""
+
+    def __init__(self, gist_id, token, transport):
+        """Build a fixture state store for existing policy scenarios."""
+        super().__init__(FixtureStateStore(gist_id, token, transport))
+
+
 class TraceTests(unittest.TestCase):
     GOOD = "visit_scheme=https\ntls=TLSv1.3\nfl=x\nip=8.8.8.8\nloc=US\n"
 
@@ -120,17 +155,17 @@ class TraceTests(unittest.TestCase):
             Path(command[command.index("--output") + 1]).write_text(self.GOOD, encoding="utf-8")
             return mock.Mock(returncode=0, stdout=b"2 0 0.412")
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(p.subprocess, "run", side_effect=fake_run):
-            self.assertEqual(p.NativeProbe("mihomo").trace(12345, temp), ("8.8.8.8", "US", "2", 412))
+            self.assertEqual(p.NativeProbe("mihomo", ipv6=True).trace(12345, temp), ("8.8.8.8", "US", "2", 412))
 
     def test_a_failed_certificate_verdict_is_not_a_measurement(self):
         def fake_run(command, **kwargs):
             Path(command[command.index("--output") + 1]).write_text(self.GOOD, encoding="utf-8")
             return mock.Mock(returncode=0, stdout=b"2 20")  # X509_V_ERR_*
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(p.subprocess, "run", side_effect=fake_run):
-            self.assertIsNone(p.NativeProbe("mihomo").trace(12345, temp))
+            self.assertIsNone(p.NativeProbe("mihomo", ipv6=True).trace(12345, temp))
 
     def test_http1_is_counted_but_not_rejected(self):
-        probe = p.NativeProbe("mihomo")
+        probe = p.NativeProbe("mihomo", ipv6=True)
         graph = p.Graph({"proxies": [node("h1"), node("h2", server="b.invalid")]})
         process = mock.Mock()
         process.poll.return_value = None
@@ -143,7 +178,7 @@ class TraceTests(unittest.TestCase):
         self.assertEqual([m.http_version for m in measured], ["1.1", "2"])
 
     def test_a_trace_from_the_runners_own_address_is_suppressed(self):
-        probe = p.NativeProbe("mihomo")
+        probe = p.NativeProbe("mihomo", ipv6=True)
         probe.baseline_ip = "8.8.8.8"
         graph = p.Graph({"proxies": [node("node")]})
         process = mock.Mock()
@@ -497,7 +532,7 @@ class PublisherTests(unittest.TestCase):
         self.old = p.plan_updates([self.initial], {})
 
     def publisher(self, transport):
-        return p.GistPublisher("abc123", "not-a-real-token", transport)
+        return FixturePublisher("abc123", "not-a-real-token", transport)
 
     def test_the_name_table_is_seeded_on_the_first_round_after_upgrade(self):
         legacy_manifest = {key: value for key, value in json.loads(self.old["manifest.json"]).items()
@@ -575,13 +610,13 @@ class PublisherTests(unittest.TestCase):
 
     def test_token_and_gist_id_outer_whitespace_stripped(self):
         remote = FakeGist(self.old)
-        publisher = p.GistPublisher("  abc123\r\n", "  test-token\r\n", remote)
+        publisher = FixturePublisher("  abc123\r\n", "  test-token\r\n", remote)
         publisher.publish([self.initial])
         self.assertEqual(remote.calls[0][2]["Authorization"], "Bearer test-token")
         self.assertEqual(remote.calls[0][1], "https://api.github.com/gists/abc123")
         for token in ("\r\n", "bad\r\ntoken"):
             with self.assertRaises(p.ProbeError):
-                p.GistPublisher("abc123", token, remote)
+                FixturePublisher("abc123", token, remote)
 
     def test_412_rereads_and_replans_bounded(self):
         remote = FakeGist(self.old)
@@ -628,9 +663,9 @@ class PublisherTests(unittest.TestCase):
                 manifest["concurrent_counter"] = len(reads)
                 remote.files["manifest.json"] = json.dumps(manifest)
             return remote(method, url, headers, body)
-        with self.assertRaises(p.ProbeError) as got:
+        with self.assertRaises(p.PublicationError) as got:
             self.publisher(transport).publish([candidate(count=5)])
-        self.assertEqual(p.error_code(got.exception), "gist_conflict")
+        self.assertEqual(p.error_code(got.exception), "state_conflict")
         self.assertEqual(len(reads), 6)
         self.assertEqual(remote.patches, [])
 
@@ -737,14 +772,14 @@ class PublisherTests(unittest.TestCase):
 class NativeTests(unittest.TestCase):
     def test_native_validation_discards_output_and_uses_real_t(self):
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(p.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
-            self.assertTrue(p.NativeProbe("/bin/mihomo").validate(temp, {"proxies": []}))
+            self.assertTrue(p.NativeProbe("/bin/mihomo", ipv6=True).validate(temp, {"proxies": []}))
             self.assertIn("-t", run.call_args.args[0])
             self.assertEqual(run.call_args.kwargs["stderr"], subprocess.DEVNULL)
             self.assertEqual(run.call_args.kwargs["stdout"], subprocess.DEVNULL)
 
     def test_invalid_individual_node_isolated_and_two_attempts(self):
         graph = p.Graph({"proxies": [node("bad"), node("ok")]})
-        probe = p.NativeProbe("mihomo")
+        probe = p.NativeProbe("mihomo", ipv6=True)
         process = mock.Mock()
         process.poll.return_value = None
         calls = []
@@ -769,7 +804,7 @@ class NativeTests(unittest.TestCase):
         """Group testing: 1 bad root among 32 stays O(log n), not O(n)."""
         names = ["bad"] + ["ok-%d" % i for i in range(31)]
         graph = p.Graph({"proxies": [node(name) for name in names]})
-        probe = p.NativeProbe("mihomo")
+        probe = p.NativeProbe("mihomo", ipv6=True)
         process = mock.Mock()
         process.poll.return_value = None
         calls = []
@@ -788,7 +823,7 @@ class NativeTests(unittest.TestCase):
 
     def test_all_invalid_batch_starts_no_kernel(self):
         graph = p.Graph({"proxies": [node("bad1"), node("bad2")]})
-        probe = p.NativeProbe("mihomo")
+        probe = p.NativeProbe("mihomo", ipv6=True)
         with mock.patch.object(probe, "validate", return_value=False), mock.patch.object(p.subprocess, "Popen") as start:
             measured, invalid, unverifiable = probe(graph, ["bad1", "bad2"])
         self.assertEqual((measured, invalid, unverifiable), ([], 2, 0))
@@ -796,7 +831,7 @@ class NativeTests(unittest.TestCase):
 
     def test_dead_kernel_at_end_discards_measurements(self):
         graph = p.Graph({"proxies": [node()]})
-        probe = p.NativeProbe("mihomo")
+        probe = p.NativeProbe("mihomo", ipv6=True)
         process = mock.Mock()
         process.poll.return_value = None
         with mock.patch.object(probe, "validate", return_value=True), mock.patch.object(probe, "health", side_effect=[True, False]), mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US")), mock.patch.object(p.subprocess, "Popen", return_value=process):
@@ -805,7 +840,7 @@ class NativeTests(unittest.TestCase):
         self.assertIsNone(result.content)
 
     def test_missing_dependency_never_probed_direct(self):
-        probe = p.NativeProbe("mihomo")
+        probe = p.NativeProbe("mihomo", ipv6=True)
         graph = p.Graph({"proxies": [node(**{"dialer-proxy": "missing"})]})
         with mock.patch.object(probe, "validate") as validate, mock.patch.object(p.subprocess, "Popen") as start:
             measured, invalid, unverifiable = probe(graph, ["node"])
@@ -823,7 +858,7 @@ class NativeTests(unittest.TestCase):
         controller port made readiness time out (kernel_start_failure).
         """
         graph = p.Graph({"proxies": [node("a")]})
-        probe = p.NativeProbe("mihomo")
+        probe = p.NativeProbe("mihomo", ipv6=True)
         process = mock.Mock()
         process.poll.return_value = None
         writes = []
@@ -845,7 +880,7 @@ class NativeTests(unittest.TestCase):
     def test_failed_nodes_get_one_short_pass_then_one_full_pass(self):
         """Pass 1 is cheap for everyone; only failures pay the full timeout."""
         graph = p.Graph({"proxies": [node("dead"), node("live")]})
-        probe = p.NativeProbe("mihomo", timeout=15)
+        probe = p.NativeProbe("mihomo", ipv6=True, timeout=15)
         process = mock.Mock()
         process.poll.return_value = None
         budgets = []
@@ -901,7 +936,11 @@ class RunnerTests(unittest.TestCase):
             return p.canonical({"proxies": [node()]}).encode(), {}
         def probe(graph, roots):
             return [p.Measurement(name, "8.8.8.8", "US") for name in roots], 0, 0
-        with tempfile.TemporaryDirectory() as temp:
+        failed_store = mock.Mock()
+        failed_store.current.return_value = ({}, None)
+        failed_store.save.side_effect = p.ProbeError("http_403")
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+                p, "publication_backends", return_value=(failed_store, None)):
             env = {"SUBSTORE_BASE": "https://fixture.invalid/SECRET", "PROBE_OUTPUT_DIR": temp, "GIST_TOKEN": "fixture\r\n", "GIST_ID": "abc123", "PROBE_FRONT_SUB": "", "PROBE_SOURCES_JSON": json.dumps(names + ["prologue"])}
             code, summary = p.run(env, transport, probe)
             self.assertEqual(code, 2)
@@ -915,7 +954,7 @@ class RunnerTests(unittest.TestCase):
             report = json.loads((Path(temp) / "measurement.json").read_text(encoding="utf-8"))
             self.assertEqual(report["alive"], 7)
             self.assertNotIn("SECRET", json.dumps(summary))
-            self.assertEqual(len(calls), 9)
+            self.assertEqual(len(calls), 8)
 
     def test_source_filter_missing_or_invalid_fails_before_download(self):
         for selected in ('[]', '{}', '["missing"]', '["airport", 3]', 'invalid'):
@@ -962,7 +1001,7 @@ class RunnerTests(unittest.TestCase):
     def test_empty_authoritative_source_list_fails_without_publish(self):
         transport = mock.Mock(return_value=(b'{"data":[]}', {}))
         with tempfile.TemporaryDirectory() as temp:
-            code, summary = p.run({"SUBSTORE_BASE": "https://fixture.invalid/private", "PROBE_OUTPUT_DIR": temp, "GIST_TOKEN": "fixture", "GIST_ID": "abc123"}, transport, mock.Mock())
+            code, summary = p.run({"SUBSTORE_BASE": "https://fixture.invalid/private", "PROBE_OUTPUT_DIR": temp}, transport, mock.Mock())
             self.assertEqual(code, 2)
             self.assertEqual(summary["failure"], 1)
             self.assertEqual(transport.call_count, 1)
@@ -983,13 +1022,8 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual((Path(temp) / p.source_file("airport")).read_text(), old)
 
 
-    def test_v6_helper_is_dispatched_from_the_fetched_configs(self):
-        """The helper's job list must come from fetch, not from the results.
-
-        That is what lets it run while the runner is still measuring instead of
-        adding its whole wall time afterwards.
-        """
-        seen = {}
+    def test_retired_helper_environment_never_starts_ssh(self):
+        """Legacy helper settings cannot start a process or settle skipped roots."""
         config = {"proxies": [node("v6", server="2606:4700:4700::1111"), node("v4")]}
 
         def transport(method, url, headers=None, body=None):
@@ -999,25 +1033,38 @@ class RunnerTests(unittest.TestCase):
 
         class Probe:
             ipv6 = False
+            ipv6_report = {"ok": False, "tcp_ok": False, "udp_ok": False,
+                           "tcp_passed": 0, "tcp_total": 2,
+                           "checks": {"private-target": "must-not-expose"},
+                           "error": "must-not-expose"}
 
             def __call__(self, graph, roots):
                 live = [p.Measurement(root, "8.8.8.8", "US") for root in roots if root == "v4"]
                 return live, 0, len(roots) - len(live)
 
-        def fake_request(jobs, env):
-            seen["jobs"] = jobs
-            return {"ok": True, "judged": 1, "promoted": 0, "error": ""}, None
-
-        with tempfile.TemporaryDirectory() as temp, mock.patch.object(p, "request_v6", side_effect=fake_request):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+                p.subprocess, "run", side_effect=AssertionError("unexpected child")) as run, mock.patch.object(
+                p.subprocess, "Popen", side_effect=AssertionError("unexpected child")) as popen:
             code, summary = p.run({"SUBSTORE_BASE": "https://fixture.invalid/private",
                                    "PROBE_OUTPUT_DIR": temp,
+                                   "PROBE_FRONT_SUB": "",
                                    "PROBE_V6_HELPER": "helper.invalid",
-                                   "PROBE_V6_SSH_PORT": "22"}, transport, Probe())
+                                   "PROBE_V6_SSH_PORT": "22",
+                                   "PROBE_V6_SSH_USER": "probe-v6",
+                                   "PROBE_V6_SSH_KEY": "must-not-expose",
+                                   "PROBE_V6_SSH_KNOWN_HOSTS": "must-not-expose"}, transport, Probe())
         self.assertEqual(code, 0)
-        self.assertEqual([job["roots"] for job in seen["jobs"]], [["v6"]])
-        self.assertTrue(summary["v6_helper"]["ok"])
-        self.assertIn("helper_s", summary["timings"])
-        self.assertIn("helper_wait_s", summary["timings"])
+        self.assertEqual((summary["alive"], summary["unverifiable"]), (1, 1))
+        self.assertEqual(summary["ipv6_transport"], {
+            "ok": False, "tcp_ok": False, "udp_ok": False,
+            "tcp_passed": 0, "tcp_total": 2, "checks": 1})
+        self.assertNotIn("must-not-expose", json.dumps(summary))
+        self.assertNotIn("private-target", json.dumps(summary))
+        self.assertNotIn("v6_helper", summary)
+        self.assertNotIn("helper_s", summary["timings"])
+        self.assertNotIn("helper_wait_s", summary["timings"])
+        run.assert_not_called()
+        popen.assert_not_called()
 
 
 class NodeLevelPolicyTests(unittest.TestCase):
@@ -1028,7 +1075,7 @@ class NodeLevelPolicyTests(unittest.TestCase):
 
     def publish(self, files, results):
         remote = FakeGist(files)
-        status, plan = p.GistPublisher("abc123", "not-a-real-token", remote).publish(results)
+        status, plan = FixturePublisher("abc123", "not-a-real-token", remote).publish(results)
         return remote, status
 
     def state(self, remote):
@@ -1118,21 +1165,14 @@ class NodeLevelPolicyTests(unittest.TestCase):
         self.assertEqual(unverifiable, 0)
         self.assertEqual(len(measured), 1)
 
-    def test_host_ipv6_capability_is_a_route_lookup(self):
-        class DeadRoute:
-            def __init__(self, family, kind):
-                pass
-            def connect(self, address):
-                raise OSError("network unreachable")
-            def close(self):
-                pass
-        class LiveRoute(DeadRoute):
-            def connect(self, address):
-                return None
-        with mock.patch.object(p.socket, "socket", return_value=DeadRoute(0, 0)):
-            self.assertFalse(p.host_ipv6_capable())
-        with mock.patch.object(p.socket, "socket", return_value=LiveRoute(0, 0)):
-            self.assertTrue(p.host_ipv6_capable())
+    def test_host_ipv6_capability_uses_verified_connectivity(self):
+        """Only the checker verdict supplies automatic IPv6 capability."""
+        for report, capable in (({}, False), ({"ok": False, "tcp_ok": True}, False),
+                                ({"ok": True, "udp_ok": False}, True)):
+            with self.subTest(report=report), mock.patch.object(
+                    p, "check_ipv6_connectivity", return_value=report) as checker:
+                self.assertIs(p.host_ipv6_capable(), capable)
+                checker.assert_called_once_with()
 
     def test_ipv6_override_parsing(self):
         self.assertIsNone(p.ipv6_override(None))
@@ -1239,78 +1279,343 @@ class NodeLevelPolicyTests(unittest.TestCase):
         self.assertEqual(manifest[broken]["guard"], "old_content_invalid")
 
 
-class V6WorkerMergeTests(unittest.TestCase):
-    """A v6-capable helper settles what an IPv4-only runner cannot."""
+class IPv6TransportTests(unittest.TestCase):
+    """Host transport evidence protects node failures without inventing successes."""
 
-    def result(self, alive=0, unverifiable=3, measured=0):
-        r = p.SourceResult("src", 3, alive, 0, None)
-        r.unverifiable = unverifiable
-        r.measured = measured
-        # The helper can only settle roots this round actually handed over; an
-        # answer naming anything else is discarded wholesale.
-        r.v6_roots = ["n1", "n2", "n3"]
-        return r
+    @staticmethod
+    def report(ok=True, udp_ok=True):
+        """Return aggregate checker evidence for the requested TCP/UDP fixture state."""
+        return {"ok": ok, "tcp_ok": ok, "udp_ok": udp_ok,
+                "tcp_passed": 2 if ok else 0, "tcp_total": 2,
+                "udp_passed": 1 if udp_ok else 0, "udp_total": 2}
 
-    def test_promotes_answered_nodes_and_shrinks_unverifiable(self):
-        result = self.result()
-        payload = {"host_ipv6": True,
-                   "judged": {"src": 2},
-                   "results": {"src": {"n1": {"alive": True, "ip": "2a0e:97c0::1", "cc": "HK"},
-                                       "n2": {"alive": True, "ip": "2a0e:97c0::2", "cc": "JP"}}}}
-        merged = p.merge_v6_results([result], payload)
-        self.assertEqual(merged[0].alive, 2)
-        self.assertEqual(merged[0].measured, 2)
-        self.assertEqual(merged[0].unverifiable, 1)      # one was never judged
-        self.assertEqual(merged[0].countries, {"HK": 1, "JP": 1})
+    def setUp(self):
+        """Replace automatic connectivity checks so every transport scenario stays offline."""
+        patcher = mock.patch.object(p, "check_ipv6_connectivity", return_value=self.report())
+        self.checker = patcher.start()
+        self.addCleanup(patcher.stop)
+        monitor_patcher = mock.patch.object(p, "Ipv6HealthMonitor", autospec=True)
+        self.monitor_factory = monitor_patcher.start()
+        self.addCleanup(monitor_patcher.stop)
+        self.monitor = self.monitor_factory.return_value
+        self.monitor.report = self.report()
+        self.monitor.tcp_failed = self.monitor.udp_failed = False
+        self.monitor.checks = 2
 
-    def test_dialled_and_silent_becomes_death_evidence(self):
-        result = self.result()
-        payload = {"host_ipv6": True, "judged": {"src": 3}, "results": {"src": {}}}
-        merged = p.merge_v6_results([result], payload)
-        # Every node the helper dialled failed: no longer unverifiable, so the
-        # source can finally be proven dead.
-        self.assertEqual(merged[0].unverifiable, 0)
-        self.assertEqual(merged[0].alive, 0)
+    def measure(self, probe, config, evidence, degraded=False, skipped=None):
+        """Measure one fixture source with supplied kernel evidence; return its result."""
+        with mock.patch.object(probe, "validate", return_value=True), mock.patch.object(
+                probe, "_run_kernel", return_value=(evidence, degraded, skipped or set())):
+            return p.measure_source("airport", config, None, probe)
 
-    def test_inert_when_the_helper_has_no_ipv6(self):
-        result = self.result()
-        payload = {"host_ipv6": False, "judged": {"src": 3}, "results": {"src": {}}}
-        merged = p.merge_v6_results([result], payload)
-        self.assertEqual(merged[0].unverifiable, 3)
+    def measure_monitored(self, probe, config, front=None, trace=None):
+        """Run the actual kernel lifecycle with fake processes, traces and a fake monitor."""
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(probe, "validate", return_value=True), mock.patch.object(
+                probe, "health", return_value=True), mock.patch.object(
+                probe, "trace", return_value=trace), mock.patch.object(
+                p.subprocess, "Popen", return_value=process):
+            return p.measure_source("airport", config, front, probe)
 
-    def test_malformed_payload_never_changes_anything(self):
-        for payload in (None, {}, {"host_ipv6": True}, {"host_ipv6": True, "judged": "x"},
-                        {"host_ipv6": True, "judged": {"src": "nope"}},
-                        {"host_ipv6": True, "judged": {"src": 1}, "results": {"src": {"n": {"alive": True, "ip": "not-ip", "cc": "HK"}}}},
-                        {"host_ipv6": True, "judged": {"src": 1}, "results": {"src": {"n": {"alive": True, "ip": "8.8.8.8", "cc": "ZZ"}}}},
-                        {"host_ipv6": True, "judged": {"src": 1}, "results": {"src": {"n": {"alive": True, "ip": "127.0.0.1", "cc": "HK"}}}}):
-            with self.subTest(payload=payload):
-                result = self.result()
-                merged = p.merge_v6_results([result], payload)
-                self.assertEqual(merged[0].alive, 0)
-                self.assertEqual(merged[0].unverifiable, 3)
+    def test_recovered_tcp_outage_never_advances_grace_across_two_rounds(self):
+        """A watcher-observed outage protects both failed roots after healthy final checks."""
+        self.monitor.tcp_failed = True
+        config = {"proxies": [node("a", server="2606:4700::1111"),
+                               node("b", server="2606:4700::1001")]}
+        probe = p.NativeProbe("mihomo")
+        old = p.plan_updates([candidate(count=2)], {})
+        retained = old[p.source_file("airport")]
+        for _ in range(2):
+            result = self.measure_monitored(probe, config)
+            self.assertFalse(result.failed)
+            self.assertEqual((result.alive, result.measured, result.unverifiable), (0, 0, 2))
+            self.assertTrue(probe.ipv6)
+            old = p.plan_updates([result], old)
+            state = json.loads(old["manifest.json"])["sources"][p.source_file("airport")]
+            self.assertEqual((state["guard"], state["bad_streak"]), ("unverifiable", 0))
+            self.assertEqual(old[p.source_file("airport")], retained)
+        self.assertEqual(self.checker.call_count, 3)
+        self.assertEqual(self.monitor.start.call_count, 2)
+        self.assertEqual(self.monitor.stop.call_count, 2)
+        self.monitor_factory.assert_called_with(self.checker)
+        self.assertEqual(probe.ipv6_monitor_checks, 4)
 
+    def test_recovered_udp_outage_protects_udp_dependency_closure_only(self):
+        """A TCP target behind a UDP front stays unproven while TCP and IPv4 failures count."""
+        self.monitor.udp_failed = True
+        config = {"proxies": [node("target", **{"dialer-proxy": "front"}),
+                               node("tcp", server="2606:4700::1001"),
+                               node("udp4", proto="tuic")]}
+        front = {"proxies": [node("front", proto="tuic", server="2606:4700::1111")]}
+        probe = p.NativeProbe("mihomo")
+        result = self.measure_monitored(probe, config, front)
+        self.assertFalse(result.failed)
+        self.assertEqual((result.alive, result.measured, result.unverifiable), (0, 2, 1))
+        self.assertTrue(probe.ipv6_udp)
+        self.assertFalse(probe._ipv6_unverifiable(p.Graph(config, front), "target"))
+        self.assertTrue(probe._ipv6_failure_unverifiable(p.Graph(config, front), "target"))
 
-    def test_helper_answer_naming_a_node_it_was_not_given_is_ignored(self):
-        """A poisoned or version-mismatched helper must not invent a node."""
-        result = self.result()
-        payload = {"host_ipv6": True, "judged": {"src": 3},
-                   "results": {"src": {"EVIL": {"alive": True, "ip": "2a0e:97c0::1", "cc": "HK"}}}}
-        merged = p.merge_v6_results([result], payload)
-        self.assertEqual(merged[0].alive, 0)
-        self.assertEqual(merged[0].unverifiable, 3)
+    def test_interruption_latches_reset_for_the_next_healthy_batch(self):
+        """An earlier outage does not skip roots or contaminate a later batch's failures."""
+        self.monitor.tcp_failed = True
+        config = {"proxies": [node("a", server="2606:4700::1111")]}
+        probe = p.NativeProbe("mihomo")
+        interrupted = self.measure_monitored(probe, config)
+        self.assertEqual(interrupted.unverifiable, 1)
+        self.monitor.tcp_failed = False
+        healthy = self.measure_monitored(probe, config)
+        self.assertFalse(healthy.failed)
+        self.assertEqual((healthy.alive, healthy.measured, healthy.unverifiable), (0, 1, 0))
+        self.assertFalse(probe._ipv6_tcp_interrupted)
+        self.assertTrue(probe.ipv6_tcp_interrupted)
+        self.assertEqual(probe.ipv6_monitor_checks, 4)
+        self.assertEqual(self.monitor.start.call_count, 2)
 
-    def test_promoted_counts_only_measurements_the_helper_added(self):
-        result = self.result(alive=1, unverifiable=2)
-        result.v6_roots = ["n2", "n3"]
-        result.measurements = [p.Measurement("n1", "8.8.8.8", "US")]
-        result.content = None
-        payload = {"host_ipv6": True, "judged": {"src": 2},
-                   "results": {"src": {"n2": {"alive": True, "ip": "2a0e:97c0::2", "cc": "JP"}}}}
-        report = p.apply_v6([result], payload, {"src": {"proxies": []}},
-                            {"ok": False, "judged": 0, "promoted": 0, "error": ""})
-        self.assertEqual(report["promoted"], 1)
-        self.assertLessEqual(report["promoted"], report["judged"])
+    def test_monitor_only_starts_for_auto_detected_accepted_ipv6_roots(self):
+        """Overrides, unavailable IPv6, IPv4 roots and invalid definitions need no watcher."""
+        cases = ((True, True, "2606:4700::1111", True),
+                 (False, False, "2606:4700::1111", True),
+                 (None, False, "2606:4700::1111", True),
+                 (None, True, "example.invalid", True),
+                 (None, True, "2606:4700::1111", False))
+        for override, capable, server, valid in cases:
+            with self.subTest(override=override, capable=capable, server=server, valid=valid):
+                self.checker.return_value = self.report(capable, capable)
+                config = {"proxies": [node("a", server=server)]}
+                probe = p.NativeProbe("mihomo", ipv6=override)
+                if valid:
+                    result = self.measure_monitored(probe, config)
+                else:
+                    with mock.patch.object(probe, "validate", return_value=False):
+                        result = p.measure_source("airport", config, None, probe)
+                self.assertFalse(result.failed)
+                self.monitor_factory.assert_not_called()
+
+    def test_monitor_stops_and_latches_when_kernel_execution_raises(self):
+        """Kernel startup exceptions cannot leave the health watcher running."""
+        self.monitor.tcp_failed = True
+        config = {"proxies": [node("a", server="2606:4700::1111")]}
+        probe = p.NativeProbe("mihomo")
+        with mock.patch.object(probe, "validate", return_value=True), mock.patch.object(
+                p.subprocess, "Popen", side_effect=OSError("fixture start failure")):
+            result = p.measure_source("airport", config, None, probe)
+        self.assertTrue(result.failed)
+        self.assertEqual(result.error, "kernel_execution_failure")
+        self.monitor.start.assert_called_once_with()
+        self.monitor.stop.assert_called_once_with()
+        self.assertTrue(probe._ipv6_tcp_interrupted)
+
+    def test_merged_monitor_protects_failed_sources_after_recovery(self):
+        """Shared kernels apply the same interruption latch and preserve successful roots."""
+        self.monitor.tcp_failed = True
+        configs = {"live": {"proxies": [node("a", server="2606:4700::1111")]},
+                   "failed": {"proxies": [node("b", server="2606:4700::1001")]}}
+        probe = p.NativeProbe("mihomo", workers=1)
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(probe, "validate", return_value=True), mock.patch.object(
+                probe, "health", return_value=True), mock.patch.object(
+                probe, "trace", side_effect=[("8.8.8.8", "US", "2", 20), None, None]), mock.patch.object(
+                p.subprocess, "Popen", return_value=process):
+            results = p.measure_all(list(configs), configs, None, probe)
+        self.assertTrue(all(not result.failed for result in results))
+        self.assertEqual([result.alive for result in results], [1, 0])
+        self.assertEqual([result.unverifiable for result in results], [0, 1])
+        self.assertEqual([result.measured for result in results], [1, 0])
+        self.assertTrue(probe.ipv6)
+        self.monitor.stop.assert_called_once_with()
+
+    def test_interrupted_monitor_preserves_success_and_reports_aggregate_counts(self):
+        """Positive traces survive both interruption flags; summaries contain no monitor details."""
+        self.monitor.tcp_failed = self.monitor.udp_failed = True
+        self.monitor.report = dict(self.report(), private_target="must-not-expose")
+        config = {"proxies": [node("a", proto="tuic", server="2606:4700::1111")]}
+        probe = p.NativeProbe("mihomo")
+        process = mock.Mock()
+        process.poll.return_value = None
+
+        def transport(method, url, headers=None, body=None):
+            """Return the selected fixture source and its definition without real HTTP."""
+            if url.endswith("/api/subs"):
+                return b'{"data":[{"name":"airport"}]}', {}
+            return p.canonical(config).encode(), {}
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                probe, "validate", return_value=True), mock.patch.object(
+                probe, "health", return_value=True), mock.patch.object(
+                probe, "trace", return_value=("8.8.8.8", "US", "2", 20)), mock.patch.object(
+                p.subprocess, "Popen", return_value=process):
+            code, summary = p.run({"SUBSTORE_BASE": "https://fixture.invalid/private",
+                                   "PROBE_FRONT_SUB": "", "PROBE_OUTPUT_DIR": directory}, transport, probe)
+        self.assertEqual(code, 0, summary)
+        self.assertEqual((summary["alive"], summary["unverifiable"]), (1, 0))
+        report = summary["ipv6_transport"]
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["monitor_checks"], 2)
+        self.assertTrue(report["tcp_interrupted"])
+        self.assertTrue(report["udp_interrupted"])
+        self.assertNotIn("must-not-expose", json.dumps(summary))
+
+    def test_auto_detection_keeps_tcp_and_udp_snapshot(self):
+        """A working TCP route does not imply the host can carry UDP adapters."""
+        report = self.report(udp_ok=False)
+        self.checker.return_value = report
+        probe = p.NativeProbe("mihomo")
+        self.assertTrue(probe.ipv6)
+        self.assertFalse(probe.ipv6_udp)
+        self.assertEqual(probe.ipv6_report, report)
+        self.checker.assert_called_once_with()
+
+    def test_explicit_overrides_never_check_the_host(self):
+        """Both fixture overrides also cover refresh and UDP without real checks."""
+        for capable in (False, True):
+            with self.subTest(capable=capable):
+                self.assertIs(p.host_ipv6_capable(capable), capable)
+                probe = p.NativeProbe("mihomo", ipv6=capable)
+                report = probe.refresh_ipv6_health()
+                self.assertTrue(report["override"])
+                self.assertIs(probe.ipv6, capable)
+                self.assertIs(probe.ipv6_udp, capable)
+                self.assertEqual(report["checks"], {})
+        self.checker.assert_not_called()
+
+    def test_udp_adapters_need_udp_only_when_the_current_ipv6_gate_applies(self):
+        """IPv4 UDP and IPv6 TCP roots remain measurable when only IPv6 UDP fails."""
+        self.checker.return_value = self.report(udp_ok=False)
+        for adapter in ("hysteria", "hysteria2", "tuic", "wireguard", "masque"):
+            with self.subTest(adapter=adapter):
+                config = {"proxies": [node("udp6", proto=adapter, server="2606:4700::1111"),
+                                       node("tcp6", server="2606:4700::1001"),
+                                       node("udp4", proto=adapter)]}
+                probe = p.NativeProbe("mihomo")
+                evidence = [(("8.8.8.8", "US", "2", 20), 0),
+                            (("1.1.1.1", "AU", "2", 30), 0)]
+                result = self.measure(probe, config, evidence)
+                self.assertFalse(result.failed)
+                self.assertEqual((result.alive, result.measured, result.unverifiable), (2, 2, 1))
+                self.assertEqual(len(yaml.safe_load(result.content)["proxies"]), 2)
+
+    def test_full_transport_loss_preserves_success_and_reclassifies_failed_v6(self):
+        """A post-dial outage protects only failed IPv6 roots, including duplicate roots."""
+        self.checker.side_effect = [self.report(), self.report(False, False)]
+        config = {"proxies": [node("v6-live", server="2606:4700::1111"),
+                               node("v6-dead", server="2606:4700::1001"),
+                               node("v6-copy", server="2606:4700::1001"), node("v4-dead")]}
+        probe = p.NativeProbe("mihomo", dedupe=True)
+        evidence = [(("2606:4700::6810:1", "US", "2", 20), 0), (None, 0), (None, 0)]
+        result = self.measure(probe, config, evidence)
+        self.assertFalse(result.failed)
+        self.assertEqual((result.alive, result.measured, result.unverifiable), (1, 2, 2))
+        self.assertEqual(result.unique_egress, 1)
+        self.assertEqual(result.countries, {"US": 1})
+        self.assertEqual(len(yaml.safe_load(result.content)["proxies"]), 1)
+        self.assertFalse(probe.ipv6)
+        self.assertEqual(self.checker.call_count, 2)
+        old = p.plan_updates([candidate(count=4)], {})
+        for _ in range(3):
+            old = p.plan_updates([result], old)
+            state = json.loads(old["manifest.json"])["sources"][p.source_file("airport")]
+            self.assertEqual(state["bad_streak"], 0)
+            self.assertEqual(old[p.source_file("airport")], candidate(count=4).content)
+
+    def test_udp_front_dependency_also_requires_ipv6_udp(self):
+        """A TCP target behind an IPv6 UDP front cannot blame the target for a UDP outage."""
+        self.checker.return_value = self.report(udp_ok=False)
+        config = {"proxies": [node("front", proto="tuic", server="2606:4700::1111"),
+                               node("target", **{"dialer-proxy": "front"})]}
+        graph = p.Graph(config)
+        probe = p.NativeProbe("mihomo")
+        self.assertTrue(probe._ipv6_unverifiable(graph, "target"))
+
+    def test_udp_loss_protects_udp_failures_and_keeps_tcp_failure_evidence(self):
+        """A UDP outage leaves working UDP measurements and ordinary TCP failures intact."""
+        self.checker.side_effect = [self.report(), self.report(udp_ok=False)]
+        config = {"proxies": [node("udp6-dead", proto="tuic", server="2606:4700::1111"),
+                               node("udp6-live", proto="hysteria2", server="2606:4700::1001"),
+                               node("tcp6-dead", server="2606:4700::64"),
+                               node("udp4-dead", proto="wireguard")]}
+        probe = p.NativeProbe("mihomo")
+        evidence = [(None, 0), (("8.8.8.8", "US", "2", 20), 0), (None, 0), (None, 0)]
+        result = self.measure(probe, config, evidence)
+        self.assertFalse(result.failed)
+        self.assertEqual((result.alive, result.measured, result.unverifiable), (1, 3, 1))
+        self.assertTrue(probe.ipv6)
+        self.assertFalse(probe.ipv6_udp)
+        self.assertEqual(self.checker.call_count, 2)
+
+    def test_udp_outage_also_protects_prefiltered_v6_roots(self):
+        """Delay rejection cannot prove a UDP node dead when the host loses UDP."""
+        self.checker.side_effect = [self.report(), self.report(udp_ok=False)]
+        config = {"proxies": [node("udp6", proto="masque", server="2606:4700::1111")]}
+        result = self.measure(p.NativeProbe("mihomo"), config, [(None, 0)], skipped={0})
+        self.assertEqual((result.alive, result.measured, result.unverifiable), (0, 0, 1))
+
+    def test_invalid_roots_stay_invalid_when_the_host_degrades(self):
+        """Transport degradation does not reclassify definitions rejected by the kernel."""
+        self.checker.side_effect = [self.report(), self.report(False, False)]
+        config = {"proxies": [node("invalid", server="2606:4700::1111"),
+                               node("dead", server="2606:4700::1001")]}
+        probe = p.NativeProbe("mihomo")
+
+        def validate(directory, document):
+            """Reject the invalid fixture definition and return the kernel verdict."""
+            return all(item["server"] != "2606:4700::1111" for item in document["proxies"])
+
+        with mock.patch.object(probe, "validate", side_effect=validate), mock.patch.object(
+                probe, "_run_kernel", return_value=([(None, 0)], False, set())):
+            result = p.measure_source("airport", config, None, probe)
+        self.assertFalse(result.failed)
+        self.assertEqual((result.invalid, result.measured, result.unverifiable), (1, 0, 1))
+
+    def test_kernel_and_ipv6_degradation_do_not_double_count_failures(self):
+        """One failed root remains one unverifiable root when both checks fail."""
+        self.checker.side_effect = [self.report(), self.report(False, False)]
+        config = {"proxies": [node("v6", server="2606:4700::1111"), node("v4")]}
+        result = self.measure(p.NativeProbe("mihomo"), config,
+                              [(None, 0), (None, 0)], degraded=True)
+        self.assertEqual((result.alive, result.measured, result.unverifiable), (0, 0, 2))
+
+    def test_merged_sources_recheck_health_before_finishing_each_source(self):
+        """A shared kernel retains positives and protects only the affected transport."""
+        scenarios = ((self.report(False, False), (0, 1, 1, 0)),
+                     (self.report(udp_ok=False), (0, 1, 0, 0)))
+        for final_report, unverifiable in scenarios:
+            with self.subTest(report=final_report):
+                self.checker.reset_mock()
+                self.checker.side_effect = [self.report(), final_report]
+                configs = {
+                    "live": {"proxies": [node("live", server="2606:4700::1111")]},
+                    "udp": {"proxies": [node("udp", proto="tuic", server="2606:4700::1001")]},
+                    "tcp": {"proxies": [node("tcp", server="2606:4700::64")]},
+                    "v4": {"proxies": [node("v4", proto="tuic")]}}
+                probe = p.NativeProbe("mihomo")
+                evidence = [(("8.8.8.8", "US", "2", 20), 0),
+                            (None, 0), (None, 0), (None, 0)]
+                with mock.patch.object(probe, "validate", return_value=True), mock.patch.object(
+                        probe, "_run_kernel", return_value=(evidence, False, {1})):
+                    results = p.measure_all(list(configs), configs, None, probe)
+                self.assertTrue(all(not result.failed for result in results))
+                self.assertEqual([result.alive for result in results], [1, 0, 0, 0])
+                self.assertEqual([result.unverifiable for result in results], list(unverifiable))
+                self.assertEqual([result.measured for result in results],
+                                 [1, 1 - unverifiable[1], 1 - unverifiable[2], 1])
+                self.assertEqual(results[1].prefiltered, 1)
+                self.assertEqual(self.checker.call_count, 2)
+
+    def test_merged_gate_skips_udp_roots_when_udp_was_already_unavailable(self):
+        """The merged path applies the same transport gate before any node dial."""
+        self.checker.return_value = self.report(udp_ok=False)
+        configs = {"udp": {"proxies": [node("udp", proto="tuic", server="2606:4700::1111")]},
+                   "tcp": {"proxies": [node("tcp", server="2606:4700::1001")]}}
+        probe = p.NativeProbe("mihomo")
+        evidence = [(("8.8.8.8", "US", "2", 20), 0)]
+        with mock.patch.object(probe, "validate", return_value=True), mock.patch.object(
+                probe, "_run_kernel", return_value=(evidence, False, set())) as kernel:
+            results = p.measure_all(list(configs), configs, None, probe)
+        self.assertEqual([result.unverifiable for result in results], [1, 0])
+        self.assertEqual([result.alive for result in results], [0, 1])
+        self.assertEqual(len(kernel.call_args.args[1]), 1)
 
 
 class SourceSecretsTests(unittest.TestCase):
@@ -1334,6 +1639,7 @@ class SourceSecretsTests(unittest.TestCase):
             '{"a": {"header": {"X": 1}}}',
             '{"a": {"query": {"t": 1}}}',
             '{"a": {"url": "ftp://other.example/sub"}}',
+            '{"a": {"url": "http://other.example/sub?token=private"}}',
             '{"a": {"url": "https://user:pass@other.example/sub"}}',
             '{"a": {"url": "not a url"}}',
         ]
@@ -1481,7 +1787,7 @@ class MeasurementDedupeTests(unittest.TestCase):
         """Same resolved connection = same dial; the verdict is repeated."""
         graph = p.Graph({"proxies": [node("a", server="1.2.3.4"),
                                      node("b", server="1.2.3.4")]})
-        probe = p.NativeProbe("mihomo", dedupe=True)
+        probe = p.NativeProbe("mihomo", ipv6=True, dedupe=True)
         process = mock.Mock()
         process.poll.return_value = None
         with mock.patch.object(probe, "validate", return_value=True), \
@@ -1504,7 +1810,7 @@ class DelayPrefilterTests(unittest.TestCase):
     def test_dead_node_costs_one_delay_call_and_is_not_traced(self):
         graph = p.Graph({"proxies": [node("dead", server="1.1.1.1"),
                                      node("live", server="2.2.2.2")]})
-        probe = p.NativeProbe("mihomo", delay_ms=2000)
+        probe = p.NativeProbe("mihomo", ipv6=True, delay_ms=2000)
         process = self._process()
 
         def delay(controller, secret, name, timeout_ms=None):
@@ -1525,7 +1831,7 @@ class DelayPrefilterTests(unittest.TestCase):
         """An API failure must never manufacture dead nodes."""
         graph = p.Graph({"proxies": [node("a", server="1.1.1.1"),
                                      node("b", server="2.2.2.2")]})
-        probe = p.NativeProbe("mihomo", delay_ms=2000)
+        probe = p.NativeProbe("mihomo", ipv6=True, delay_ms=2000)
         process = self._process()
         with mock.patch.object(probe, "validate", return_value=True), \
              mock.patch.object(probe, "health", return_value=True), \
@@ -1541,7 +1847,7 @@ class DelayPrefilterTests(unittest.TestCase):
     def test_a_slow_node_is_retried_before_being_skipped(self):
         """One short budget is stricter than curl; the retry protects the tail."""
         graph = p.Graph({"proxies": [node("slow", server="1.1.1.1")]})
-        probe = p.NativeProbe("mihomo", delay_ms=3000, delay_retry_ms=8000)
+        probe = p.NativeProbe("mihomo", ipv6=True, delay_ms=3000, delay_retry_ms=8000)
         process = self._process()
         budgets = []
 
@@ -1563,7 +1869,7 @@ class DelayPrefilterTests(unittest.TestCase):
 
     def test_controller_errors_are_not_retried(self):
         graph = p.Graph({"proxies": [node("a", server="1.1.1.1")]})
-        probe = p.NativeProbe("mihomo", delay_ms=3000, delay_retry_ms=8000)
+        probe = p.NativeProbe("mihomo", ipv6=True, delay_ms=3000, delay_retry_ms=8000)
         process = self._process()
         with mock.patch.object(probe, "validate", return_value=True), \
              mock.patch.object(probe, "health", return_value=True), \
@@ -1576,7 +1882,7 @@ class DelayPrefilterTests(unittest.TestCase):
 
     def test_curl_time_total_supplies_delay_when_the_prefilter_is_off(self):
         graph = p.Graph({"proxies": [node("a", server="1.1.1.1")]})
-        probe = p.NativeProbe("mihomo")
+        probe = p.NativeProbe("mihomo", ipv6=True)
         process = self._process()
         with mock.patch.object(probe, "validate", return_value=True), \
              mock.patch.object(probe, "health", return_value=True), \
@@ -1601,7 +1907,7 @@ class MergedKernelTests(unittest.TestCase):
     def test_two_sources_share_one_kernel_and_keep_attribution(self):
         jobs = [self._job("alpha", "a", "1.1.1.1"),
                 self._job("beta", "b", "2.2.2.2")]
-        probe = p.NativeProbe("mihomo")
+        probe = p.NativeProbe("mihomo", ipv6=True)
         process = self._process()
         written = []
         with mock.patch.object(probe, "validate", return_value=True), \
@@ -1627,7 +1933,7 @@ class MergedKernelTests(unittest.TestCase):
         def validate(directory, cfg):
             return all(proxy.get("server") != "bad.invalid" for proxy in cfg["proxies"])
 
-        probe = p.NativeProbe("mihomo")
+        probe = p.NativeProbe("mihomo", ipv6=True)
         process = self._process()
         with mock.patch.object(probe, "validate", side_effect=validate), \
              mock.patch.object(probe, "health", return_value=True), \
@@ -1648,7 +1954,7 @@ class MergedKernelTests(unittest.TestCase):
                 calls.append(list(roots))
                 return ([p.Measurement(roots[0], "8.8.8.8", "US")], 0, 0)
 
-        probe = FallbackProbe("mihomo")
+        probe = FallbackProbe("mihomo", ipv6=True)
         with mock.patch.object(probe, "_measure_group", side_effect=p.ProbeError("kernel_start_failure")):
             outcomes = probe.measure_jobs(jobs)
         self.assertEqual(calls, [["a"], ["b"]])
@@ -1658,7 +1964,7 @@ class MergedKernelTests(unittest.TestCase):
     def test_prefiltered_nodes_are_counted_per_source(self):
         jobs = [self._job("alpha", "a", "1.1.1.1"),
                 self._job("beta", "b", "2.2.2.2")]
-        probe = p.NativeProbe("mihomo", delay_ms=3000)
+        probe = p.NativeProbe("mihomo", ipv6=True, delay_ms=3000)
         process = mock.Mock()
         process.poll.return_value = None
 

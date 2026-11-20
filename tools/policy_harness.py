@@ -17,6 +17,7 @@ import json
 import sys
 import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import actions_probe_all as probe  # noqa: E402
@@ -88,7 +89,9 @@ class Harness:
                "PROBE_OUTPUT_DIR": "/tmp/harness-out-%s" % self.name,
                "GIST_TOKEN": "fixture", "GIST_ID": "abc123",
                "PROBE_FRONT_SUB": ""}
-        return probe.run(env, self.transport, self.probe_fn)
+        store = MemoryState(self.gist)
+        with mock.patch.object(probe, "publication_backends", return_value=(store, None)):
+            return probe.run(env, self.transport, self.probe_fn)
 
     def manifest(self):
         return json.loads(self.gist.files.get("manifest.json", "{}")).get("sources", {})
@@ -102,6 +105,22 @@ class Harness:
 
     def dropped(self, source):
         return probe.source_file(source) not in self.gist.files
+
+
+class MemoryState:
+    """Hold state in memory while exercising the production policy publisher."""
+
+    def __init__(self, gist):
+        """Retain the historical harness container, without any network writes."""
+        self.gist = gist
+
+    def current(self):
+        """Return a copied snapshot and a fixture revision."""
+        return dict(self.gist.files), "fixture"
+
+    def save(self, files, version):
+        """Replace all managed fixture state with one accepted policy plan."""
+        self.gist.files = dict(files)
 
 
 def scenario(title):

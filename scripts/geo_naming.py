@@ -31,6 +31,7 @@ import concurrent.futures
 import ipaddress
 import json
 import os
+from pathlib import Path
 import re
 import threading
 import time
@@ -263,11 +264,35 @@ def t2s(text):
 
 
 def _doh_json(base, name):
+    """Return a bounded HTTPS DNS JSON response for one explicit lookup name."""
     url = base + "?" + urllib.parse.urlencode({"name": name, "type": "TXT"})
-    req = urllib.request.Request(
-        url, headers={"User-Agent": UA, "Accept": "application/dns-json"})
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as response:
-        return json.loads(response.read().decode("utf-8", "replace"))
+    return _geo_json(url, headers={"User-Agent": UA, "Accept": "application/dns-json"})
+
+
+class GeoRedirect(urllib.request.HTTPRedirectHandler):
+    """Forbid HTTPS downgrade and cross-origin forwarding in optional enrichment."""
+
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        """Allow only a redirect within the original HTTPS origin; return a request."""
+        before, after = urllib.parse.urlsplit(request.full_url), urllib.parse.urlsplit(new_url)
+        if (after.scheme != "https" or after.username is not None
+                or (after.scheme, after.netloc) != (before.scheme, before.netloc)):
+            raise ValueError("geo_redirect")
+        return super().redirect_request(request, response, code, message, headers, new_url)
+
+
+def _geo_json(url, headers=None, body=None, timeout=None):
+    """Read at most 2 MiB of HTTPS geo JSON without ambient proxy configuration."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.username is not None:
+        raise ValueError("geo_https_required")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), GeoRedirect())
+    request = urllib.request.Request(url, data=body, headers=headers or {})
+    with opener.open(request, timeout=timeout or _TIMEOUT) as response:
+        data = response.read(2 * 1024 * 1024 + 1)
+    if len(data) > 2 * 1024 * 1024:
+        raise ValueError("geo_response_large")
+    return json.loads(data)
 
 
 def cymru_asn_cc(ip):
@@ -308,11 +333,12 @@ def _ipapi_batch(ips):
         data = None
         for _ in range(2):
             try:
-                req = urllib.request.Request(
-                    "http://ip-api.com/batch?fields=query,country,countryCode,"
-                    "regionName,city,as,asname&lang=zh-CN",
-                    data=body, headers={"Content-Type": "application/json"})
-                data = json.loads(urllib.request.urlopen(req, timeout=20).read())
+                # The free endpoint may refuse HTTPS; treat it as unavailable.
+                # Optional enrichment must never fall back to plaintext.
+                data = _geo_json(
+                    "https://ip-api.com/batch?fields=query,country,countryCode,"
+                    "regionName,city,as,asname&lang=zh-CN", body=body,
+                    headers={"Content-Type": "application/json"}, timeout=20)
                 break
             except Exception:
                 time.sleep(1)
@@ -335,9 +361,7 @@ def _ipwho(ip):
     """ipwho.is single IP -> {cc, city, region, country, asn, org} | None."""
     try:
         url = "https://ipwho.is/" + urllib.parse.quote(str(ip), safe="")
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as response:
-            data = json.loads(response.read().decode("utf-8", "replace"))
+        data = _geo_json(url, headers={"User-Agent": UA})
         if data.get("success") is False:
             return None
         conn = data.get("connection") or {}
@@ -587,16 +611,12 @@ class Resolver:
         gaps = [ip for ip in ips
                 if not (ipapi.get(ip) or {}).get("cc")
                 or not (ipapi.get(ip) or {}).get("asname")]
-        remaining = [min(IPWHO_BUDGET, len(gaps))]
-
         def _who(ip):
-            if remaining[0] <= 0:
-                return ip, None
-            remaining[0] -= 1
+            """Query one pre-budgeted exit and return the provider result."""
             return ip, _ipwho(ip)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(gaps) or 1)) as pool:
-            for ip, result in pool.map(_who, gaps):
+            for ip, result in pool.map(_who, gaps[:IPWHO_BUDGET]):
                 if result:
                     ipwho[ip] = result
         with self._lock:
@@ -698,7 +718,66 @@ RESOLVER = Resolver()
 
 
 def prefetch(items):
+    """Populate the resolver using explicitly enabled online lookup providers."""
     RESOLVER.prefetch(items)
+
+
+def prefetch_offline(items):
+    """Populate exit names from local ASN data/cache only; never make HTTP calls."""
+    global PREFETCH_SECONDS
+    started = time.monotonic()
+    if _ASN_DB_PATH_WANTED():
+        _ASN_DB.load()
+    cached = load_geo_cache(os.environ.get("PROBE_GEO_CACHE", ""))
+    with RESOLVER._lock:
+        for ip, cc in dict(items).items():
+            if ip in RESOLVER._cache:
+                continue
+            entry = dict(cached.get(ip) or _blank(cc))
+            asn, organization = _ASN_DB.lookup(ip)
+            entry["cc"] = cc or entry.get("cc", "")
+            entry["asn"] = asn or entry.get("asn", 0)
+            entry["org"] = _org_brand(organization, asn) if asn else entry.get("org", "")
+            RESOLVER._cache[ip] = entry
+    PREFETCH_SECONDS += time.monotonic() - started
+
+
+_FILE_CACHE = {}
+
+
+def load_geo_cache(path):
+    """Read a bounded, fresh local geo cache once per file revision; return entries."""
+    if not path:
+        return {}
+    try:
+        source = Path(path)
+        status = source.stat()
+        cache_key = (str(source.resolve()), status.st_mtime_ns, status.st_size)
+        if cache_key in _FILE_CACHE:
+            return _FILE_CACHE[cache_key]
+        if status.st_size > 8 * 1024 * 1024:
+            return {}
+        document = json.loads(source.read_text(encoding="utf-8"))
+        if document.get("version") != 1 or time.time() - document["updated_at"] > 30 * 86400:
+            return {}
+        entries = {}
+        for ip, value in document["entries"].items():
+            if not ipaddress.ip_address(ip).is_global or not isinstance(value, dict):
+                continue
+            entry = _blank()
+            for field in entry:
+                cell = value.get(field)
+                if field == "asn":
+                    if isinstance(cell, int) and not isinstance(cell, bool) and 0 <= cell <= 2 ** 32 - 1:
+                        entry[field] = cell
+                elif isinstance(cell, str) and len(cell) <= 100 and not any(ord(ch) < 32 for ch in cell):
+                    entry[field] = cell
+            entries[ip] = entry
+        _FILE_CACHE.clear()
+        _FILE_CACHE[cache_key] = entries
+        return entries
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {}
 
 
 def display_name(ip, fallback_cc=""):
