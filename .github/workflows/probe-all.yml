@@ -133,9 +133,12 @@ jobs:
           SOURCE_SECRETS_JSON: ${{ secrets.SOURCE_SECRETS_JSON }}
           MIHOMO_BIN: ${{ runner.temp }}/bin/mihomo
           PROBE_OUTPUT_DIR: ${{ runner.temp }}/probe-output
-          # Tracing is I/O bound (one curl per node against one shared kernel),
-          # well under NativeProbe's 32-worker clamp on a 4-core runner.
-          PROBE_CONCURRENCY: '24'
+          # Tracing is I/O bound (one short curl per node against one shared
+          # kernel), so the ceiling is the kernel/fd budget, not CPU. 24 left
+          # the 4-core runner idle: a 1355-node round spent 441s, ~96% of it
+          # dead nodes waiting out a timeout. Each node now gets a short first
+          # pass and only failures pay the full PROBE_TIMEOUT in a second pass.
+          PROBE_CONCURRENCY: '64'
           PROBE_GEO_LOOKUP: '1'
           PROBE_SOURCES_JSON: ${{ inputs.sources_json }}
           # IPv6-bound nodes cannot be dialled from an IPv4-only runner. The
@@ -150,6 +153,9 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          # One fd per in-flight dial plus the kernel's listeners. The raised
+          # concurrency is I/O bound, so the fd ceiling is the real limit.
+          ulimit -n 65536 || true
           test -n "$SUBSTORE_BASE"
           test -n "$GIST_TOKEN"
           python scripts/actions_probe_all.py

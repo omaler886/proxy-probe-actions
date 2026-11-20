@@ -178,6 +178,15 @@ def merge_v6_results(results, payload):
         answered = answers.get(result.name) or {}
         if not isinstance(answered, dict):
             continue
+        # Only roots this round actually handed to the helper can be settled.
+        # An answer about any other name is either a version mismatch or a
+        # poisoned helper; promoting it would invent measurements, and the
+        # rebuild would then raise KeyError on a node that is not in the graph.
+        # One unknown name invalidates the whole source answer: the helper is
+        # not describing this round's job, so none of its verdicts are usable.
+        roots = set(result.v6_roots)
+        if any(name not in roots for name in answered):
+            continue
         promoted = []
         for name, verdict in answered.items():
             if not isinstance(verdict, dict) or not verdict.get("alive"):
@@ -195,7 +204,7 @@ def merge_v6_results(results, payload):
         # A node is proven dead only when the helper dialled it and said nothing
         # about it. An answer we cannot parse proves nothing either way, so it
         # must leave the node unverifiable instead of silently killing it.
-        silent = max(0, count - len(answered))
+        silent = max(0, min(count, len(roots)) - len(answered))
         settled = len(promoted) + silent
         if not settled:
             continue
@@ -635,11 +644,19 @@ def private_write(path, content):
             os.unlink(tmp)
 
 
+#: Returned by ``NativeProbe.trace`` when the response came from the runner
+#: itself. It is neither a measurement nor a failure worth retrying.
+DIRECT_LEAK = object()
+
+
 @dataclass
 class Measurement:
     name: str
     ip: str
     cc: str
+    #: Negotiated protocol from curl ("2", "1.1", ...); empty when unknown
+    #: (for example a v6 node settled by the helper, which does not report it).
+    http_version: str = ""
 
 
 @dataclass
@@ -652,6 +669,9 @@ class SourceResult:
     failed: bool = False
     error: str = ""
     unique_egress: int = 0
+    #: Alive nodes that negotiated HTTP/1.1 instead of HTTP/2. A downgraded hop
+    #: is recorded for audit; it never deletes a node on its own.
+    http1: int = 0
     countries: dict = field(default_factory=dict)
     #: Roots this round actually dialled. Roots with an unusable configuration
     #: are invalid; roots that need IPv6 on an IPv4-only host are unverifiable.
@@ -671,12 +691,29 @@ class SourceResult:
     v6_roots: list = field(default_factory=list)
 
 
+#: Upper bound on concurrent node dials. Each dial is one 1KB trace through the
+#: shared kernel, so the cost is I/O and remote RTT, not CPU. 32 was far below
+#: the saturation point: a 1355-node round spent 441s at 24 workers, and ~96% of
+#: those node-seconds were dead nodes sitting in a timeout.
+MAX_WORKERS = 256
+
+
 class NativeProbe:
     def __init__(self, binary, workers=8, timeout=15, transport=None, ipv6=None):
         self.binary = binary
-        self.workers = max(1, min(32, int(workers)))
+        self.workers = max(1, min(MAX_WORKERS, int(workers)))
         self.timeout = max(1, min(120, int(timeout)))
+        #: Readiness polling must NOT reuse Transport. That opener retries a
+        #: refused socket with a 1s/2s backoff, so a kernel that bound in 0.2s
+        #: was observed ready only after ~1.1s -- per source, with the whole
+        #: worker pool idle. A single short attempt is the right tool.
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.transport = transport or Transport(timeout=2)
+        #: The runner's own egress address, set by run() before measuring. A
+        #: node that reports it did not carry the traffic, so it is dropped.
+        self.baseline_ip = None
+        #: Measurements dropped because they came out of the runner itself.
+        self.suppressed = 0
         # IPv6 capability is a HOST property. When the host cannot reach IPv6,
         # a node with an IPv6 literal server is unverifiable from here, never
         # dead: it may be alive on the user's own IPv6 network.
@@ -691,32 +728,87 @@ class NativeProbe:
         except (OSError, subprocess.TimeoutExpired):
             raise ProbeError("kernel_validation_failure") from None
 
-    def trace(self, port, directory):
-        # stdout is a private regular file, not a captured named pipe (Windows).
+    def trace(self, port, directory, timeout=None):
+        # A 1KB trace needs a small budget, not the full node timeout: a node
+        # that cannot deliver it in a few seconds is already unusable for real
+        # traffic. The caller uses the short budget first and spends the full
+        # one only on the nodes that failed, so a dead node costs fast+full
+        # instead of full+full.
+        budget = self.timeout if timeout is None else max(1, min(self.timeout, int(timeout)))
         fd, path = tempfile.mkstemp(prefix="trace-", dir=str(directory))
         os.chmod(path, 0o600)
+        os.close(fd)
         try:
-            with os.fdopen(fd, "wb") as stream:
-                run = subprocess.run([
-                    "curl", "--disable", "--silent", "--show-error", "--fail", "--noproxy", "",
-                    "--proxy", "http://127.0.0.1:" + str(port), "--max-time", str(self.timeout),
-                    "--connect-timeout", str(min(10, self.timeout)), "--proto", "=https",
-                    "--max-filesize", "65536", TRACE_URL,
-                ], stdout=stream, stderr=subprocess.DEVNULL, timeout=self.timeout + 3)
+            # curl writes the body itself and prints one metadata line on
+            # stdout. Streaming the body to stdout (the old shape) left no room
+            # for the negotiated protocol or the certificate verdict.
+            run = subprocess.run([
+                "curl", "--disable", "--silent", "--show-error", "--fail", "--noproxy", "",
+                "--proxy", "http://127.0.0.1:" + str(port), "--max-time", str(budget),
+                # curl's connect timeout only covers the loopback socket to
+                # the kernel (milliseconds). The node's own dial is bounded
+                # by --max-time; keep this short so a stuck controller is
+                # visible instead of eating the whole budget.
+                "--connect-timeout", str(min(4, budget)), "--proto", "=https",
+                "--max-filesize", "65536",
+                "--output", path, "--write-out", "%{http_version} %{ssl_verify_result}",
+                TRACE_URL,
+            ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=budget + 3)
             if run.returncode:
                 return None
-            return parse_trace(Path(path).read_text(encoding="utf-8"))
+            ok, version = self.negotiation(run.stdout)
+            if not ok:
+                return None
+            ip, cc = parse_trace(Path(path).read_text(encoding="utf-8"))
+            if self.baseline_ip and ip == self.baseline_ip:
+                # The exit is the runner itself: the request never entered the
+                # node (a config bug or a silent DIRECT fallback). Not a
+                # measurement, and not worth a retry either.
+                self.suppressed += 1
+                return DIRECT_LEAK
+            return ip, cc, version
         except (OSError, UnicodeError, subprocess.TimeoutExpired, ProbeError):
             return None
         finally:
             if os.path.exists(path):
                 os.unlink(path)
 
-    def health(self, process, controller, secret):
+    @staticmethod
+    def negotiation(raw):
+        """Parse curl's write-out: ``(verified, http_version)``.
+
+        ``ssl_verify_result`` is 0 for a validated chain; a non-zero value means
+        curl reached the endpoint without trusting it, which is never a usable
+        measurement. HTTP/1.1 is recorded, not rejected: the caller reports it
+        as ``http1`` so a downgraded hop is visible instead of silent.
+        """
+        try:
+            parts = raw.decode("utf-8", "replace").split()
+        except Exception:
+            return False, ""
+        if len(parts) < 2:
+            return True, ""
+        try:
+            verified = int(parts[1]) == 0
+        except ValueError:
+            verified = False
+        return verified, parts[0]
+
+    def health(self, process, controller, secret, once=False):
         if process.poll() is not None:
             return False
+        url = "http://127.0.0.1:" + str(controller) + "/version"
+        headers = {"Authorization": "Bearer " + secret}
+        if once:
+            # Startup readiness: one short attempt, no retry and no backoff.
+            try:
+                request = urllib.request.Request(url, headers=headers)
+                with self.opener.open(request, timeout=0.4) as response:
+                    return isinstance(json.loads(response.read()), dict) and process.poll() is None
+            except Exception:
+                return False
         try:
-            raw, _ = self.transport("GET", "http://127.0.0.1:" + str(controller) + "/version", {"Authorization": "Bearer " + secret})
+            raw, _ = self.transport("GET", url, headers)
             return isinstance(json.loads(raw), dict) and process.poll() is None
         except Exception:
             return False
@@ -777,30 +869,42 @@ class NativeProbe:
             ports = unused_ports(len(accepted) + 1)
             controller = ports[-1]
             cfg = kernel_config(graph, accepted, ports[:-1], controller, secret)
-            if not self.validate(directory, cfg):
+            # _assess already validated every accepted root. The only difference
+            # here is the listener port numbers, and ``-t`` does not bind them,
+            # so re-validating the identical node set is a second kernel start
+            # per source that buys no new evidence. Only re-check when the batch
+            # had to be split (something was rejected), where the combined body
+            # has genuinely never been tested.
+            if accepted != measurable and not self.validate(directory, cfg):
                 raise ProbeError("kernel_config_failure")
             process = None
             try:
                 process = subprocess.Popen([self.binary, "-d", str(directory), "-f", str(directory / "config.yaml")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 deadline = time.monotonic() + 15
-                while not self.health(process, controller, secret):
+                while not self.health(process, controller, secret, once=True):
                     if process.poll() is not None or time.monotonic() > deadline:
                         raise ProbeError("kernel_start_failure")
-                    time.sleep(0.1)
+                    time.sleep(0.05)
 
-                def one(pair):
-                    root, port = pair
-                    for _ in range(2):
-                        evidence = self.trace(port, directory)
-                        if evidence:
-                            return Measurement(root, *evidence)
-                    return None
-
+                lanes = list(zip(accepted, ports[:-1]))
+                # Two passes, not "the same attempt twice". Pass 1 gives every
+                # node a short budget; nothing that needs longer than that for
+                # 1KB is usable anyway. Only the failures spend the full budget
+                # in pass 2, so a transient error still gets its retry while a
+                # dead node stops costing 2 x the full timeout.
+                fast = max(3, min(6, self.timeout // 3))
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
-                    measured = list(pool.map(one, zip(accepted, ports[:-1])))
+                    evidence = list(pool.map(lambda lane: self.trace(lane[1], directory, fast), lanes))
+                    retry = [index for index, item in enumerate(evidence) if item is None]
+                    if retry:
+                        for index, item in zip(retry, pool.map(lambda index: self.trace(lanes[index][1], directory), retry)):
+                            evidence[index] = item
                 if not self.health(process, controller, secret):
                     raise ProbeError("kernel_end_failure")
-                return [item for item in measured if item], len(invalid), unverifiable
+                measured = [Measurement(lanes[index][0], *item)
+                            for index, item in enumerate(evidence)
+                            if item is not None and item is not DIRECT_LEAK]
+                return measured, len(invalid), unverifiable
             except OSError:
                 raise ProbeError("kernel_execution_failure") from None
             finally:
@@ -935,6 +1039,40 @@ def source_output(source, graph, measurements):
     return canonical(graph.export(roots, names)), len(selected)
 
 
+def runner_exit_ip(transport):
+    """The runner's own egress address, or None when it cannot be determined.
+
+    One direct request, no proxy. This is the baseline that lets the probe tell
+    "the node carried the traffic" from "the request leaked out of the runner"
+    (a config bug or a silent DIRECT fallback). A failure is not fatal: the
+    check is skipped rather than guessed.
+    """
+    try:
+        raw, _ = transport("GET", TRACE_URL)
+        ip, cc = parse_trace(raw.decode("utf-8", "replace"))
+        return ip
+    except Exception:
+        return None
+
+
+def front_health(config, probe):
+    """Whether the shared front can be dialled this round (None = not judged).
+
+    Front nodes are copied into every dependent source's closure, so from
+    inside those sources a dead front looks exactly like dead nodes. Measuring
+    the front once per round is what makes the difference visible.
+    """
+    try:
+        graph = Graph(dedupe_names(config))
+        roots = [item["name"] for item in config.get("proxies") or [] if isinstance(item, dict)]
+        if not roots:
+            return None
+        measurements, _, _ = probe(graph, roots)
+        return bool(measurements)
+    except Exception:
+        return None
+
+
 def measure_source(name, config, front, probe):
     result = SourceResult(name, input=len(config.get("proxies", [])))
     try:
@@ -957,6 +1095,11 @@ def measure_source(name, config, front, probe):
         result.unverifiable = unverifiable
         result.measured = max(0, len(roots) - invalid - unverifiable)
         result.unique_egress = len({egress_key(item.ip) for item in measurements})
+        # HTTP/1.1-only exits are kept (some clients and nodes are h1 only) but
+        # counted, so a downgraded middlebox shows up in the manifest instead of
+        # looking identical to a healthy h2 node.
+        result.http1 = sum(1 for item in measurements
+                           if item.http_version and not item.http_version.startswith("2"))
         for item in measurements:
             result.countries[item.cc] = result.countries.get(item.cc, 0) + 1
         # A missing dependency is a per-node validation failure, never stripped.
@@ -967,20 +1110,31 @@ def measure_source(name, config, front, probe):
     return result
 
 
-def merge_sources(contents):
-    """Dedup tested roots by resolved connection, retain independent namespaces."""
+def merge_sources(contents, corrupt=None):
+    """Dedup tested roots by resolved connection, retain independent namespaces.
+
+    A single unparsable retained artifact (truncated upload, hand edit,
+    ``proxies: null``) is skipped when ``corrupt`` is supplied, and its name is
+    appended to that list. Without it the old behaviour is kept and the error
+    propagates. One bad file used to abort every publication, every round.
+    """
     choices = {}
     for filename, text in sorted(contents.items()):
-        doc = yaml.safe_load(text)
-        if not isinstance(doc, dict) or not isinstance(doc.get("proxies"), list):
-            raise ProbeError("old_content_invalid")
-        graph = Graph(doc)
-        for node in doc["proxies"]:
-            name = node["name"]
-            if name.startswith("__front-"):
-                continue
-            fp = graph.identity(name)
-            choices.setdefault(fp, (filename, graph, name))
+        try:
+            doc = yaml.safe_load(text)
+            if not isinstance(doc, dict) or not isinstance(doc.get("proxies"), list):
+                raise ProbeError("old_content_invalid")
+            graph = Graph(doc)
+            for node in doc["proxies"]:
+                name = node["name"]
+                if name.startswith("__front-"):
+                    continue
+                fp = graph.identity(name)
+                choices.setdefault(fp, (filename, graph, name))
+        except (ProbeError, yaml.YAMLError, TypeError, ValueError, KeyError, AttributeError) as exc:
+            if corrupt is None:
+                raise ProbeError("old_content_invalid") from exc
+            corrupt.append(filename)
     merged_nodes, merged_groups = {}, {}
     for fp in sorted(choices):
         _, graph, root = choices[fp]
@@ -1022,15 +1176,181 @@ def merge_sources(contents):
 #: never enough: a transient network failure must not empty a subscription.
 BAD_STREAK_LIMIT = 2
 
+#: Upper bound on the consecutive "no node-level evidence" counter. It is
+#: carried to the Gist because an unjudgeable source must be visible, but a
+#: permanently unprovable one (a dead front nobody can measure) must stop
+#: creating revisions of its own after a couple of days.
+UNPROVEN_ROUNDS_CAP = 9
+
+
+#: Connection fingerprints are sha256 hex; 16 characters is enough of a key to
+#: identify a node in the persisted name table without storing 64 bytes each.
+NAME_KEY_LEN = 16
+
+
+def _free_name(desired, used):
+    """``desired`` if free, else the smallest free ``base-N`` (2, 3, ...)."""
+    if desired not in used:
+        return desired
+    base = re.sub(r"-\d+$", "", desired)
+    index = 2
+    candidate = "%s-%d" % (base, index)
+    while candidate in used:
+        index += 1
+        candidate = "%s-%d" % (base, index)
+    return candidate
+
+
+def freeze_names(documents, tables):
+    """Give every root a name that persists across rounds.
+
+    The old contract derived the disambiguator from *this round's* sibling set
+    and from per-round geolocation, so a node changed name whenever a sibling
+    died, a lookup timed out or a new source appeared (339 of 534 published
+    names were ordinals). Names are now allocated once and stored per published
+    file, then reused forever. A brand-new connection takes the smallest free
+    ordinal next to its display name, so the published shape stays ``-2``/
+    ``-3`` instead of some opaque tag.
+
+    ``documents`` maps scope -> YAML text and ``tables`` maps scope ->
+    ``{fingerprint: name}`` (updated in place). Each published file is its own
+    namespace: the same connection may legitimately carry a different name in
+    its source file and in the merged subscription, and both must be stable.
+
+    Returns ``(frozen_documents, {scope: seen_keys})``.
+    """
+    frozen_docs, seen = {}, {}
+    for scope, text in sorted(documents.items()):
+        table = tables.get(scope)
+        if not isinstance(table, dict):
+            table = tables[scope] = {}
+        used = {value for value in table.values() if isinstance(value, str) and value}
+        keys = set()
+        try:
+            doc = yaml.safe_load(text)
+            if not isinstance(doc, dict) or not isinstance(doc.get("proxies"), list):
+                frozen_docs[scope] = text
+                seen[scope] = keys
+                continue
+            graph = Graph(doc)
+        except (ProbeError, yaml.YAMLError, TypeError, ValueError):
+            frozen_docs[scope] = text
+            seen[scope] = keys
+            continue
+        roots, rename, occurrences = [], {}, {}
+        # Pass 1: honour every name already frozen. The reserved names of front
+        # nodes and groups are derived from their own fingerprint and are
+        # already stable, so they are left alone.
+        for item in doc["proxies"]:
+            name = item.get("name") if isinstance(item, dict) else None
+            if not isinstance(name, str) or name.startswith("__front-"):
+                continue
+            try:
+                base = graph.identity(name)[:NAME_KEY_LEN]
+            except ProbeError:
+                continue
+            # A source may legitimately carry two nodes with an identical
+            # connection (same fingerprint, different labels). They are
+            # interchangeable but must keep distinct names, so the k-th
+            # occurrence gets its own key instead of collapsing onto the first.
+            seen_count = occurrences.get(base, 0)
+            occurrences[base] = seen_count + 1
+            key = base if seen_count == 0 else "%s~%d" % (base, seen_count)
+            roots.append((name, key))
+            keys.add(key)
+            stored = table.get(key)
+            if isinstance(stored, str) and stored:
+                used.add(stored)
+                if stored != name:
+                    rename[name] = stored
+        # Pass 2: a connection seen for the first time takes its current display
+        # name when free, otherwise the next ordinal. This is the only moment a
+        # name is ever chosen, so later rounds cannot move it.
+        for name, key in roots:
+            if isinstance(table.get(key), str) and table.get(key):
+                continue
+            chosen = _free_name(rename.get(name, name), used)
+            table[key] = chosen
+            used.add(chosen)
+            if chosen != name:
+                rename[name] = chosen
+        seen[scope] = keys
+        if not rename:
+            frozen_docs[scope] = text
+            continue
+        for field in ("proxies", "proxy-groups"):
+            for item in doc.get(field) or []:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("name") in rename:
+                    item["name"] = rename[item["name"]]
+                if item.get("dialer-proxy") in rename:
+                    item["dialer-proxy"] = rename[item["dialer-proxy"]]
+                refs = item.get("proxies")
+                if isinstance(refs, list):
+                    item["proxies"] = [rename.get(value, value) for value in refs]
+        frozen_docs[scope] = canonical(doc)
+    return frozen_docs, seen
+
+
+def prune_names(tables, seen):
+    """Drop name entries that no longer appear in any published file.
+
+    Bounded growth without per-round churn: entries survive while the tables
+    are small and are dropped only once they outgrow the live set by 2x (or
+    1000 connections). A pruned connection that returns gets a new name -- the
+    only case in which that can still happen.
+    """
+    live = sum(len(keys) for keys in seen.values())
+    total = sum(len(table) for table in tables.values() if isinstance(table, dict))
+    if total <= max(1000, 2 * live):
+        return tables
+    pruned = {}
+    for scope, table in tables.items():
+        if not isinstance(table, dict):
+            continue
+        keep = seen.get(scope) or set()
+        kept = {key: value for key, value in table.items() if key in keep}
+        if kept:
+            pruned[scope] = kept
+    return pruned
+
+
+def load_name_table(text):
+    """Read the persisted ``scope -> {fingerprint: name}`` map from the manifest."""
+    try:
+        document = json.loads(text or "{}")
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(document, dict):
+        return {}
+    raw = document.get("names")
+    if not isinstance(raw, dict):
+        return {}
+    tables = {}
+    for scope, entries in raw.items():
+        if not isinstance(scope, str) or not scope or not isinstance(entries, dict):
+            continue
+        tables[scope] = {key: value for key, value in entries.items()
+                         if isinstance(key, str) and key
+                         and isinstance(value, str) and value}
+    return tables
+
 
 def plan_updates(results, old):
     try:
         old_manifest = json.loads(old.get("manifest.json", "{}"))
+        if not isinstance(old_manifest, dict):
+            raise ValueError
         previous = old_manifest.get("sources", {})
         if not isinstance(previous, dict):
             raise ValueError
     except (ValueError, TypeError):
         raise ProbeError("manifest_invalid") from None
+    # The persisted name table: fingerprint -> published name. Absent in older
+    # manifests, in which case names are allocated this round and stored.
+    names = load_name_table(old.get("manifest.json", ""))
+    name_keys = {}
     # Deliberately retain remote sources absent from today's authoritative selection,
     # except artifacts that were produced by measuring our own published files
     # (a `gist-` source). Those are self-referential and must not survive a fix
@@ -1054,23 +1374,46 @@ def plan_updates(results, old):
         # An older valid file without metadata still receives a conservative gate.
         if not prior_alive and filename in effective:
             doc = yaml.safe_load(effective[filename])
-            prior_alive = sum(not item.get("name", "").startswith("__front-") for item in doc.get("proxies", []))
+            # A truncated or hand-edited artifact must not abort the round: the
+            # baseline is unknown, so it falls back to 0 and the normal gate
+            # applies instead of raising AttributeError on None forever.
+            if isinstance(doc, dict):
+                prior_alive = sum(not item.get("name", "").startswith("__front-") for item in doc.get("proxies") or [])
         try:
             streak = max(0, int(last.get("bad_streak", 0)))
         except (ValueError, TypeError):
             streak = 0
+        try:
+            unproven_rounds = max(0, int(last.get("unproven_rounds", 0)))
+        except (ValueError, TypeError):
+            unproven_rounds = 0
         # Death evidence. A node counts as dead only when THIS round dialled it
         # and the attempt failed. A source we could not fetch, a source whose
         # nodes hang off a dead front, and a node that needs IPv6 on an
         # IPv4-only host are all UNPROVEN: they must never delete a node.
+        #
+        # ``measured > 0`` is load-bearing. Batch validation can reject every
+        # root without dialling a single one (an unsupported field, a kernel
+        # version change, a ``-t`` timeout, one shared broken dependency). That
+        # is "these could not be judged", not "these are dead" -- treating it
+        # as death deleted healthy sources two rounds after a parse regression.
         proven_dead = (not result.failed
+                       and result.measured > 0
                        and result.alive == 0
                        and result.unverifiable == 0
                        and (not result.uses_front or result.front_alive is True))
         if result.failed:
             accept, guard = False, "source_failure"
         elif result.alive > 0:
-            if prior_alive and result.alive < prior_alive * 0.5:
+            # A smaller set may only replace the artifact when every missing
+            # node was actually dialled and failed. Nodes this host cannot
+            # reach (no IPv6) and a front that was never proven healthy are not
+            # evidence, and publishing the reduced set would delete them --
+            # exactly what the node-level contract forbids.
+            unproven = result.unverifiable > 0 or (result.uses_front and result.front_alive is not True)
+            if unproven and result.alive < prior_alive:
+                accept, guard, streak = False, "unproven_hold", streak
+            elif prior_alive and result.alive < prior_alive * 0.5:
                 # Severely reduced. The surviving set is node-level truth, but
                 # a single bad round must not shrink a good subscription: the
                 # reduced set replaces the old one only after the second
@@ -1087,9 +1430,23 @@ def plan_updates(results, old):
             streak += 1
             accept = False
             guard = "confirmed_dead" if streak >= BAD_STREAK_LIMIT else "zero_alive"
+        elif result.measured == 0:
+            # Nothing was dialled: no root passed configuration validation, or
+            # every root needs a host capability this runner lacks. Neither is
+            # death evidence, so the artifact is kept and bad_streak stays put.
+            accept = False
+            guard = "unverifiable" if result.unverifiable else "not_dialled"
         else:
             accept = False
-            guard = "unverifiable" if result.unverifiable else "zero_alive"
+            if result.uses_front and result.front_alive is not True:
+                # The front may be the only reason these nodes failed. Keep the
+                # artifact (the node contract), but advance a separate counter:
+                # a front nobody measures used to freeze bad_streak at zero
+                # forever, so a genuinely dead source looked identical to an
+                # unprovable one and never surfaced.
+                guard = "front_unproven"
+            else:
+                guard = "unverifiable" if result.unverifiable else "zero_alive"
         if accept:
             try:
                 candidate = yaml.safe_load(result.content)
@@ -1102,6 +1459,16 @@ def plan_updates(results, old):
                 accept = False
             if not accept:
                 guard = "candidate_invalid"
+        # Consecutive rounds that produced no node-level evidence at all
+        # (unmeasurable nodes, unprovable front). Kept separate from bad_streak,
+        # which only counts proven failures, so a source nobody can judge
+        # becomes visible without ever being deleted. A fetch failure advances
+        # nothing: it is transient and must not create revision noise (it is
+        # already visible as ``guard=source_failure``).
+        if result.alive > 0 or proven_dead:
+            unproven_rounds = 0
+        elif not result.failed:
+            unproven_rounds = min(UNPROVEN_ROUNDS_CAP, unproven_rounds + 1)
         if guard == "confirmed_dead" and streak >= BAD_STREAK_LIMIT:
             # Node-level cleanup: the dead nodes leave the subscription and the
             # source file is removed on the same PATCH.
@@ -1113,6 +1480,7 @@ def plan_updates(results, old):
                 "preserved": False, "guard": "confirmed_dead",
                 "measured": result.measured, "invalid": result.invalid,
                 "unverifiable": result.unverifiable, "bad_streak": streak,
+                "unproven_rounds": unproven_rounds, "http1": result.http1,
                 "uses_front": result.uses_front,
             }
             continue
@@ -1125,18 +1493,47 @@ def plan_updates(results, old):
             "preserved": not accept, "guard": guard,
             "measured": result.measured, "invalid": result.invalid,
             "unverifiable": result.unverifiable, "bad_streak": streak,
+            "unproven_rounds": unproven_rounds, "http1": result.http1,
             "uses_front": result.uses_front,
         }
+    # Freeze names for the sources published this round, then for the merged
+    # projection (which also covers retained artifacts rendered by an older
+    # version). Only a connection seen for the first time can receive a new
+    # name; everything already in the table keeps it forever.
     if effective:
-        merged = merge_sources(effective)
-    elif dropped:
-        # Every source was proven dead this round: the merged body must drop
-        # the nodes too, otherwise the dead nodes survive in the subscription.
-        merged = canonical({"proxies": []})
-    else:
-        # Nothing published yet and nothing dropped: keep whatever the previous
-        # round produced rather than writing an empty subscription.
-        merged = old.get("mihomo-alive.yaml", canonical({"proxies": []}))
+        # Every published file, including preserved ones: a retained artifact
+        # already carries frozen names, so this is a no-op for it while its
+        # connections still count as live for pruning.
+        frozen, seen = freeze_names(dict(effective), names)
+        effective.update(frozen)
+        name_keys.update(seen)
+    corrupt = []
+    if effective:
+        merged = merge_sources(effective, corrupt)
+        for filename in corrupt:
+            # Quarantine instead of aborting the round: drop the unusable
+            # artifact from the plan (deleted on the same PATCH) and record the
+            # reason. Retaining it would poison every future merge.
+            effective.pop(filename, None)
+            previous_entry = manifest["sources"].get(filename, {})
+            manifest["sources"][filename] = {
+                "name": previous_entry.get("name", ""), "input": 0, "alive": 0,
+                "published": 0, "last_success_alive": 0, "preserved": False,
+                "guard": "old_content_invalid", "corrupt": True,
+                "measured": 0, "invalid": 0, "unverifiable": 0,
+                "bad_streak": 0, "unproven_rounds": 0, "uses_front": False,
+            }
+    if not effective:
+        # Nothing usable remains. Every source proven dead means the merged body
+        # must drop the nodes too; anything else (including a round whose only
+        # artifacts were corrupt) keeps the previous body instead of writing an
+        # empty subscription over it.
+        merged = (canonical({"proxies": []}) if dropped
+                  else old.get("mihomo-alive.yaml", canonical({"proxies": []})))
+    merged_doc, merged_seen = freeze_names({"merged": merged}, names)
+    merged = merged_doc["merged"]
+    name_keys.update(merged_seen)
+    manifest["names"] = prune_names(names, name_keys)
     for filename, content in effective.items():
         entry = manifest["sources"].setdefault(filename, {})
         entry["sha256"] = digest(content)
@@ -1152,27 +1549,40 @@ def manifest_state_changed(old_text, new_text) -> bool:
 
     The survival baseline (``last_success_alive``) and the grace counter
     (``bad_streak``) decide whether a source is republished or dropped, so
-    they must reach the Gist. Audit-only fields (guard, preserved, counts)
-    may lag: a failed round must not create a revision on its own.
+    they must reach the Gist. ``unproven_rounds`` is carried too: without it an
+    unjudgeable source is invisible (the counter would reset to 0 every round
+    because it never persisted). It is capped, so a permanently unprovable
+    source stops creating revisions after a couple of days. The name table also
+    has to be seeded once: on the first round after the upgrade every allocated
+    name equals the current one, so nothing else would change and the table
+    would never persist. Audit-only fields (guard, preserved, counts) may lag:
+    a failed round must not create a revision on its own.
     """
     try:
-        old = json.loads(old_text or "{}").get("sources", {})
-        new = json.loads(new_text or "{}").get("sources", {})
+        old_doc = json.loads(old_text or "{}")
+        new_doc = json.loads(new_text or "{}")
+        old = old_doc.get("sources", {})
+        new = new_doc.get("sources", {})
     except (ValueError, TypeError, AttributeError):
         return True
     if not isinstance(old, dict) or not isinstance(new, dict):
+        return True
+    if new_doc.get("names") and not old_doc.get("names"):
         return True
     for key, entry in new.items():
         previous = old.get(key)
         if not isinstance(entry, dict):
             continue
         if not isinstance(previous, dict):
-            if entry.get("last_success_alive") or entry.get("bad_streak"):
+            if (entry.get("last_success_alive") or entry.get("bad_streak")
+                    or entry.get("unproven_rounds")):
                 return True
             continue
         if entry.get("last_success_alive") != previous.get("last_success_alive"):
             return True
         if (entry.get("bad_streak") or 0) != (previous.get("bad_streak") or 0):
+            return True
+        if (entry.get("unproven_rounds") or 0) != (previous.get("unproven_rounds") or 0):
             return True
     for key in old:
         if key not in new:
@@ -1280,7 +1690,7 @@ def result_reports(results, files=None):
                         "unique_egress": item.unique_egress, "countries": item.countries,
                         "measured": item.measured, "unverifiable": item.unverifiable,
                         "bad_streak": state.get("bad_streak", 0),
-                        "uses_front": item.uses_front})
+                        "http1": item.http1, "uses_front": item.uses_front})
     return reports
 
 
@@ -1297,28 +1707,36 @@ def _ssh_target(env):
     return user + "@" + host
 
 
-def measure_v6_out_of_band(results, configs, env):
-    """Settle IPv6-bound nodes on a host that really has IPv6.
+def v6_bound_roots(config, front=None):
+    """Roots whose dial chain needs an IPv6 literal. Pure graph work, no dial.
 
-    The runner ships one JSON job over SSH to ``PROBE_V6_HELPER`` and reads one
-    JSON answer back. Nothing is opened to the network beyond that SSH session,
-    and no subscription body is written to the helper's disk.
+    Computed from the fetched config *before* measuring so the helper can start
+    at the same time as the runner instead of waiting for it.
+    """
+    try:
+        graph = Graph(dedupe_names(config), front)
+    except ProbeError:
+        return []
+    roots = []
+    for item in config.get("proxies") or []:
+        name = item.get("name") if isinstance(item, dict) else None
+        if isinstance(name, str) and name in graph.nodes and graph.v6_bound(name):
+            roots.append(name)
+    return roots
 
-    Returns a small non-sensitive report for the run summary. Any failure keeps
-    the round exactly as measured (nodes stay unverifiable) rather than changing
-    a publication on a guess.
+
+def request_v6(jobs, env):
+    """Ship one job list to the IPv6 helper and return ``(report, answer)``.
+
+    Runs concurrently with the runner's own measurement: nothing here depends
+    on this round's results, only on the fetched configs. ``answer`` is None
+    whenever any part of the exchange failed, so a broken helper can never
+    change a publication on a guess.
     """
     report = {"ok": False, "judged": 0, "promoted": 0, "error": ""}
-    jobs = []
-    for result in results:
-        if result.failed or not result.v6_roots:
-            continue
-        jobs.append({"source": result.name,
-                     "config": configs.get(result.name) or {},
-                     "roots": list(result.v6_roots)})
     if not jobs:
         report["ok"] = True
-        return report
+        return report, None
     payload = {"mihomo": env.get("PROBE_V6_MIHOMO", "/opt/probe-v6/bin/mihomo"),
                "timeout": int(env.get("PROBE_TIMEOUT", 15)),
                "workers": int(env.get("PROBE_V6_WORKERS", 4)),
@@ -1349,7 +1767,7 @@ def measure_v6_out_of_band(results, configs, env):
                              timeout=int(env.get("PROBE_V6_TIMEOUT", 900)))
     except (OSError, subprocess.SubprocessError):
         report["error"] = "helper_unreachable"
-        return report
+        return report, None
     if run.returncode != 0:
         report["error"] = "helper_failed"
         # The ssh client explains itself on stderr (refused, host key, kex).
@@ -1358,30 +1776,46 @@ def measure_v6_out_of_band(results, configs, env):
         if first:
             report["detail"] = first[0][:120]
         report["rc"] = run.returncode
-        return report
+        return report, None
     try:
         answer = json.loads(run.stdout.decode("utf-8", "replace"))
     except ValueError:
         report["error"] = "helper_answer_invalid"
-        return report
+        return report, None
+    return report, answer
+
+
+def apply_v6(results, answer, configs, report):
+    """Merge the helper's verdicts into this round and rebuild affected files.
+
+    ``promoted`` is the number of measurements the helper actually added -- not
+    the alive count of every source that happened to own a v6 root, which made
+    the summary claim more promotions than the number of nodes it judged.
+    """
     if not isinstance(answer, dict) or not answer.get("host_ipv6"):
-        report["error"] = "helper_without_ipv6"
+        report["error"] = report.get("error") or "helper_without_ipv6"
         return report
+    before = sum(len(item.measurements) for item in results)
     merge_v6_results(results, answer)
+    promoted = sum(len(item.measurements) for item in results) - before
     for result in results:
         if result.failed or not result.content:
             continue
-        if result.measurements:
+        # Only a source that actually handed roots to the helper can have new
+        # measurements; re-exporting every other source would repeat its
+        # geolocation prefetch for nothing.
+        if result.v6_roots and result.measurements:
             try:
                 graph = Graph(dedupe_names(configs[result.name]))
                 result.content, result.published = source_output(
                     result.name, graph, result.measurements)
-            except ProbeError:
+            except Exception:
+                # A helper answer we cannot apply must not abort the round: the
+                # previous content stands and the report explains why.
                 report["error"] = "rebuild_failed"
     report["ok"] = True
     report["judged"] = sum(int(v or 0) for v in (answer.get("judged") or {}).values())
-    report["promoted"] = sum(item.alive for item in results
-                             if not item.failed and item.v6_roots)
+    report["promoted"] = max(0, promoted)
     for message in answer.get("errors") or []:
         if isinstance(message, str):
             report.setdefault("helper_errors", []).append(message[:60])
@@ -1429,9 +1863,11 @@ def run(env=None, transport=None, probe=None):
             raise ProbeError("sources_empty")
         summary["phase"] = "fetch"
         # Fetch EVERY selected source this round; no history skip. The GETs
-        # are independent and I/O bound, so they share a small thread pool;
-        # urllib opens a fresh connection per call and Transport keeps no
-        # per-request state between them.
+        # are independent and I/O bound, so they share a thread pool; urllib
+        # opens a fresh connection per call and Transport keeps no
+        # per-request state between them. 16 is ~2x the old 8 (38 sources took
+        # 11.8s in 5 waves) while still leaving the one Sub-Store host room to
+        # answer instead of queueing.
         configs = {}
         mark = time.monotonic()
 
@@ -1441,7 +1877,7 @@ def run(env=None, transport=None, probe=None):
             except Exception as exc:
                 return name, None, error_code(exc)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(sources))) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(sources))) as pool:
             for name, config, failure in pool.map(fetch_one, sources):
                 if failure:
                     results.append(SourceResult(name, failed=True, error=failure))
@@ -1455,36 +1891,74 @@ def run(env=None, transport=None, probe=None):
             except Exception:
                 pass  # Individual missing dependencies fail closed in Graph.
         summary["timings"]["fetch_s"] = round(time.monotonic() - mark, 1)
+        # Baseline the runner's own egress before any node is dialled: a trace
+        # that comes back with this address never entered the proxy.
+        if hasattr(probe, "baseline_ip"):
+            probe.baseline_ip = runner_exit_ip(transport)
+        # IPv6-bound nodes cannot be dialled from an IPv4-only host. The helper
+        # settles exactly those, and its job list depends only on the fetched
+        # configs -- never on this round's results -- so it runs CONCURRENTLY
+        # with the runner instead of adding its whole wall time afterwards.
+        helper_pool = helper_future = None
+        helper_started = 0.0
+        # Only a host that cannot reach IPv6 needs the helper, and only a
+        # configured helper is worth the graph walk that finds its jobs.
+        if (getattr(probe, "ipv6", True) is False
+                and env.get("PROBE_V6_HELPER", "").strip()
+                and env.get("PROBE_V6_SSH_PORT")):
+            v6_map = {name: v6_bound_roots(configs[name], front) for name in sources if name in configs}
+            helper_jobs = [{"source": name, "config": configs[name], "roots": v6_map[name]}
+                           for name in sources if name in configs and v6_map[name]]
+            if helper_jobs:
+                helper_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                helper_started = time.monotonic()
+                helper_future = helper_pool.submit(request_v6, helper_jobs, env)
         summary["phase"] = "measure"
         mark = time.monotonic()
         for name in sources:
             if name in configs:
                 results.append(measure_source(name, configs[name], front, probe))
+        # The front is fetched for its definitions but is usually not a source
+        # of its own, so nobody measured it and ``front_alive`` stayed None --
+        # which froze every front-backed source's streak at zero forever. One
+        # explicit measurement (health only, never published) makes attribution
+        # possible; a dead front must never delete a node. The verdict is read
+        # after the helper merge, so a v6 front that the helper settled counts.
+        front_measured = None
+        if front is not None and not any(item.name == front_name for item in results):
+            front_measured = front_health(front, probe)
         results.sort(key=lambda item: sources.index(item.name))
         summary["timings"]["measure_s"] = round(time.monotonic() - mark, 1)
-        # IPv6-bound nodes cannot be dialled from an IPv4-only host. When a
-        # helper with real IPv6 is configured, hand it exactly those nodes: it
-        # settles them (alive, or proven dead) and this round is rebuilt from
-        # the union. Without a helper they stay unverifiable, which is honest.
-        helper = env.get("PROBE_V6_HELPER", "").strip()
-        if helper and env.get("PROBE_V6_SSH_PORT"):
+        # Join the helper only after the runner's own round is done. In the
+        # common case it finished during measurement, so this wait is ~0.
+        if helper_future is not None:
             mark = time.monotonic()
-            summary["v6_helper"] = measure_v6_out_of_band(results, configs, env)
-            summary["timings"]["helper_s"] = round(time.monotonic() - mark, 1)
+            report, answer = helper_future.result()
+            summary["timings"]["helper_wait_s"] = round(time.monotonic() - mark, 1)
+            summary["v6_helper"] = report
+            if answer is not None:
+                apply_v6(results, answer, configs, report)
+            # helper_s is the helper's own wall time, not extra wall time: it
+            # overlaps measure_s by design, so the phases no longer sum to
+            # total_s. helper_wait_s is what the runner actually blocked on.
+            summary["timings"]["helper_s"] = round(time.monotonic() - helper_started, 1)
+            helper_pool.shutdown(wait=False)
         # Geolocation runs inside source_output's prefetch (runner round and
         # helper rebuild alike); the resolver accumulates its own wall time.
         summary["timings"]["geo_s"] = round(geo_naming.PREFETCH_SECONDS, 1)
-        # Front health decides whether a front-dependent source may be judged
-        # dead: with a dead front, its nodes failed for someone else's reason.
         front_result = next((item for item in results if item.name == front_name), None)
-        front_alive = None
         if front_result is not None:
             front_alive = bool(not front_result.failed and front_result.alive > 0)
+        else:
+            front_alive = front_measured
         for item in results:
             item.front_alive = front_alive
         summary.update(input=sum(item.input for item in results), alive=sum(item.alive for item in results), failure=sum(item.failed or not item.alive for item in results))
         summary["ipv6"] = getattr(probe, "ipv6", None)
         summary["unverifiable"] = sum(item.unverifiable for item in results)
+        # Traces that came back with the runner's own address: the node did not
+        # carry them. Should be 0; anything else is a leak worth investigating.
+        summary["direct_leak"] = getattr(probe, "suppressed", 0)
         if requested:
             summary["results"] = result_reports(results)
         summary["phase"] = "checkpoint"

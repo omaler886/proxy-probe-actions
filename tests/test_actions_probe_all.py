@@ -104,7 +104,7 @@ class TraceTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(p.ProbeError):
                 p.parse_trace(text)
 
-    def test_curl_is_explicit_proxy_and_no_pipe(self):
+    def test_curl_is_explicit_proxy_and_reports_the_negotiation(self):
         def fake_run(command, **kwargs):
             self.assertEqual(command[:2], ["curl", "--disable"])
             self.assertIn("--fail", command)
@@ -112,11 +112,54 @@ class TraceTests(unittest.TestCase):
             self.assertEqual(command[command.index("--proxy") + 1], "http://127.0.0.1:12345")
             self.assertIn("--max-time", command)
             self.assertEqual(command[-1], p.TRACE_URL)
-            self.assertNotEqual(kwargs["stdout"], subprocess.PIPE)
-            kwargs["stdout"].write(self.GOOD.encode())
-            return mock.Mock(returncode=0)
+            # Body goes to a private file, stdout carries the metadata line, so
+            # the JSON trace and the protocol verdict never interleave.
+            self.assertIn("--output", command)
+            self.assertIn("--write-out", command)
+            self.assertEqual(kwargs["stdout"], subprocess.PIPE)
+            Path(command[command.index("--output") + 1]).write_text(self.GOOD, encoding="utf-8")
+            return mock.Mock(returncode=0, stdout=b"2 0")
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(p.subprocess, "run", side_effect=fake_run):
-            self.assertEqual(p.NativeProbe("mihomo").trace(12345, temp), ("8.8.8.8", "US"))
+            self.assertEqual(p.NativeProbe("mihomo").trace(12345, temp), ("8.8.8.8", "US", "2"))
+
+    def test_a_failed_certificate_verdict_is_not_a_measurement(self):
+        def fake_run(command, **kwargs):
+            Path(command[command.index("--output") + 1]).write_text(self.GOOD, encoding="utf-8")
+            return mock.Mock(returncode=0, stdout=b"2 20")  # X509_V_ERR_*
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(p.subprocess, "run", side_effect=fake_run):
+            self.assertIsNone(p.NativeProbe("mihomo").trace(12345, temp))
+
+    def test_http1_is_counted_but_not_rejected(self):
+        probe = p.NativeProbe("mihomo")
+        graph = p.Graph({"proxies": [node("h1"), node("h2", server="b.invalid")]})
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(probe, "validate", return_value=True), \
+             mock.patch.object(probe, "health", return_value=True), \
+             mock.patch.object(probe, "trace", side_effect=[("1.1.1.1", "US", "1.1"), ("8.8.8.8", "US", "2")]), \
+             mock.patch.object(p.subprocess, "Popen", return_value=process):
+            measured, invalid, unverifiable = probe(graph, ["h1", "h2"])
+        self.assertEqual(len(measured), 2)
+        self.assertEqual([m.http_version for m in measured], ["1.1", "2"])
+
+    def test_a_trace_from_the_runners_own_address_is_suppressed(self):
+        probe = p.NativeProbe("mihomo")
+        probe.baseline_ip = "8.8.8.8"
+        graph = p.Graph({"proxies": [node("node")]})
+        process = mock.Mock()
+        process.poll.return_value = None
+
+        def fake_run(command, **kwargs):
+            Path(command[command.index("--output") + 1]).write_text(self.GOOD, encoding="utf-8")
+            return mock.Mock(returncode=0, stdout=b"2 0")
+
+        with mock.patch.object(probe, "validate", return_value=True), \
+             mock.patch.object(probe, "health", return_value=True), \
+             mock.patch.object(p.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(p.subprocess, "Popen", return_value=process):
+            measured, invalid, unverifiable = probe(graph, ["node"])
+        self.assertEqual(measured, [])
+        self.assertEqual(probe.suppressed, 1)
 
 
 class SelectionTests(unittest.TestCase):
@@ -342,6 +385,99 @@ class DependencyTests(unittest.TestCase):
         self.assertTrue(any("dialer-proxy" in n for n in merged["proxies"]))
 
 
+class NameFreezeTests(unittest.TestCase):
+    """A published name is allocated once and then never moves."""
+
+    def setUp(self):
+        self.graph = p.Graph({"proxies": [node("a", "ss", "a.invalid"),
+                                          node("b", "ss", "b.invalid"),
+                                          node("c", "ss", "c.invalid")]})
+        self.exits = {"a": "8.8.8.1", "b": "8.8.8.2", "c": "8.8.8.3"}
+
+    def render(self, alive):
+        measurements = [p.Measurement(name, self.exits[name], "US") for name in alive]
+        text, published = p.source_output("airport", self.graph, measurements)
+        return p.SourceResult("airport", 3, len(alive), published, text, measured=3)
+
+    def names(self, files):
+        return {item["server"]: item["name"]
+                for item in yaml.safe_load(files[p.source_file("airport")])["proxies"]}
+
+    def test_a_frozen_name_does_not_move_when_a_sibling_disappears(self):
+        files = p.plan_updates([self.render(["a", "b", "c"])], {})
+        first = self.names(files)
+        self.assertEqual(len(set(first.values())), 3)
+        # One node dies: the survivors' display names are recomputed from a
+        # smaller sibling set, but the persisted table overrides that.
+        files = p.plan_updates([self.render(["a", "c"])], files)
+        second = self.names(files)
+        self.assertEqual(second["a.invalid"], first["a.invalid"])
+        self.assertEqual(second["c.invalid"], first["c.invalid"])
+
+    def test_a_new_connection_takes_the_next_free_ordinal(self):
+        files = p.plan_updates([self.render(["a", "b"])], {})
+        first = self.names(files)
+        files = p.plan_updates([self.render(["a", "b", "c"])], files)
+        third = self.names(files)["c.invalid"]
+        self.assertNotIn(third, first.values())
+        self.assertRegex(third, r"-\d+$")
+
+    def test_the_table_is_persisted_and_reused(self):
+        files = p.plan_updates([self.render(["a", "b", "c"])], {})
+        manifest = json.loads(files["manifest.json"])
+        # One namespace per published file: the source artifact and the merged
+        # subscription each carry the three connections.
+        self.assertIn(p.source_file("airport"), manifest["names"])
+        self.assertIn("merged", manifest["names"])
+        self.assertEqual(sum(len(entries) for entries in manifest["names"].values()), 6)
+        # A round in which every source is preserved keeps the same table.
+        kept = p.plan_updates([], files)
+        self.assertEqual(json.loads(kept["manifest.json"])["names"], manifest["names"])
+
+    def test_merged_names_are_frozen_across_sources(self):
+        def result(source, name, server):
+            graph = p.Graph({"proxies": [node(name, "ss", server)]})
+            text, published = p.source_output(source, graph, [p.Measurement(name, "8.8.8.1", "US")])
+            return p.SourceResult(source, 1, 1, published, text, measured=1)
+
+        # Same display name, different connection: the merge has to disambiguate
+        # them, and that disambiguation must not move between rounds.
+        one = result("alpha", "n1", "a.invalid")
+        two = result("beta", "n1", "b.invalid")
+        files = p.plan_updates([one, two], {})
+        first = {item["server"]: item["name"]
+                 for item in yaml.safe_load(files["mihomo-alive.yaml"])["proxies"]}
+        self.assertEqual(len(set(first.values())), 2)
+        files = p.plan_updates([two, one], files)
+        second = {item["server"]: item["name"]
+                  for item in yaml.safe_load(files["mihomo-alive.yaml"])["proxies"]}
+        self.assertEqual(second, first)
+
+    def test_two_nodes_with_the_same_connection_keep_distinct_names(self):
+        # Real sources carry duplicate connections under different labels. They
+        # are interchangeable, but collapsing them onto one frozen name would
+        # make the artifact unparsable on the next round (duplicate name).
+        graph = p.Graph({"proxies": [node("a", "ss", "same.invalid"),
+                                      node("b", "ss", "same.invalid")]})
+        self.assertEqual(graph.identity("a"), graph.identity("b"))
+        text, published = p.source_output(
+            "airport", graph,
+            [p.Measurement("a", "8.8.8.1", "US"), p.Measurement("b", "8.8.8.2", "US")])
+        result = p.SourceResult("airport", 2, 2, published, text, measured=2)
+        files = p.plan_updates([result], {})
+        names = [item["name"] for item in yaml.safe_load(files[p.source_file("airport")])["proxies"]]
+        self.assertEqual(len(names), 2)
+        self.assertEqual(len(set(names)), 2)
+        files = p.plan_updates([result], files)
+        self.assertEqual(len(yaml.safe_load(files[p.source_file("airport")])["proxies"]), 2)
+
+    def test_free_name_never_produces_a_double_suffix(self):
+        used = {"🇺🇸美国-Unknown", "🇺🇸美国-Unknown-2"}
+        self.assertEqual(p._free_name("🇺🇸美国-Unknown-2", used), "🇺🇸美国-Unknown-3")
+        self.assertEqual(p._free_name("🇺🇸美国-Unknown-7", {"🇺🇸美国-Unknown-7"}), "🇺🇸美国-Unknown-2")
+        self.assertEqual(p._free_name("fresh", used), "fresh")
+
+
 class PublisherTests(unittest.TestCase):
     def setUp(self):
         self.initial = candidate(count=4)
@@ -349,6 +485,17 @@ class PublisherTests(unittest.TestCase):
 
     def publisher(self, transport):
         return p.GistPublisher("abc123", "not-a-real-token", transport)
+
+    def test_the_name_table_is_seeded_on_the_first_round_after_upgrade(self):
+        legacy_manifest = {key: value for key, value in json.loads(self.old["manifest.json"]).items()
+                           if key != "names"}
+        legacy = dict(self.old, **{"manifest.json": json.dumps(legacy_manifest)})
+        remote = FakeGist(legacy)
+        status, _ = self.publisher(remote).publish([self.initial])
+        # Nothing about the subscription changed; only the table is new, and it
+        # still has to reach the Gist or it would never persist.
+        self.assertEqual(status, "published")
+        self.assertIn("names", json.loads(remote.files["manifest.json"]))
 
     def test_no_change_no_patch_even_counts_changed(self):
         remote = FakeGist(self.old)
@@ -655,6 +802,28 @@ class NativeTests(unittest.TestCase):
         validate.assert_not_called()
         start.assert_not_called()
 
+    def test_failed_nodes_get_one_short_pass_then_one_full_pass(self):
+        """Pass 1 is cheap for everyone; only failures pay the full timeout."""
+        graph = p.Graph({"proxies": [node("dead"), node("live")]})
+        probe = p.NativeProbe("mihomo", timeout=15)
+        process = mock.Mock()
+        process.poll.return_value = None
+        budgets = []
+
+        def trace(port, directory, timeout=None):
+            budgets.append(timeout)
+            return None
+
+        with mock.patch.object(probe, "validate", return_value=True), \
+             mock.patch.object(probe, "health", return_value=True), \
+             mock.patch.object(probe, "trace", side_effect=trace), \
+             mock.patch.object(p.subprocess, "Popen", return_value=process):
+            measured, invalid, unverifiable = probe(graph, ["dead", "live"])
+        # Two nodes share pass 1 at the short budget (15 // 3 = 5); the two
+        # failures then share pass 2 at the full budget (None -> self.timeout).
+        self.assertEqual(budgets, [5, 5, None, None])
+        self.assertEqual(measured, [])
+
 
 class TransportTests(unittest.TestCase):
     def test_retry_503_and_oserror_but_not_401_403_412(self):
@@ -774,6 +943,43 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual((Path(temp) / p.source_file("airport")).read_text(), old)
 
 
+    def test_v6_helper_is_dispatched_from_the_fetched_configs(self):
+        """The helper's job list must come from fetch, not from the results.
+
+        That is what lets it run while the runner is still measuring instead of
+        adding its whole wall time afterwards.
+        """
+        seen = {}
+        config = {"proxies": [node("v6", server="2606:4700:4700::1111"), node("v4")]}
+
+        def transport(method, url, headers=None, body=None):
+            if url.endswith("/api/subs"):
+                return b'{"data":[{"name":"airport"}]}', {}
+            return p.canonical(config).encode(), {}
+
+        class Probe:
+            ipv6 = False
+
+            def __call__(self, graph, roots):
+                live = [p.Measurement(root, "8.8.8.8", "US") for root in roots if root == "v4"]
+                return live, 0, len(roots) - len(live)
+
+        def fake_request(jobs, env):
+            seen["jobs"] = jobs
+            return {"ok": True, "judged": 1, "promoted": 0, "error": ""}, None
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(p, "request_v6", side_effect=fake_request):
+            code, summary = p.run({"SUBSTORE_BASE": "https://fixture.invalid/private",
+                                   "PROBE_OUTPUT_DIR": temp,
+                                   "PROBE_V6_HELPER": "helper.invalid",
+                                   "PROBE_V6_SSH_PORT": "22"}, transport, Probe())
+        self.assertEqual(code, 0)
+        self.assertEqual([job["roots"] for job in seen["jobs"]], [["v6"]])
+        self.assertTrue(summary["v6_helper"]["ok"])
+        self.assertIn("helper_s", summary["timings"])
+        self.assertIn("helper_wait_s", summary["timings"])
+
+
 class NodeLevelPolicyTests(unittest.TestCase):
     """Node-level cleanup: a node proven dead must leave the subscription."""
 
@@ -855,7 +1061,10 @@ class NodeLevelPolicyTests(unittest.TestCase):
         self.assertEqual(invalid, 0)
         self.assertEqual([m.name for m in measured], ["v4node"])
         # The IPv6 node is never dialled: every validated config is the IPv4 one.
-        self.assertEqual(len(validate.call_args_list), 2)  # per-root + combined
+        # The batch that ran during _assess is the only validation: the
+        # combined config differs only in listener ports, which -t cannot see,
+        # so re-validating the identical accepted set buys no evidence.
+        self.assertEqual(len(validate.call_args_list), 1)  # batch only
         for call in validate.call_args_list:
             self.assertNotIn("2606:4700:4700::1111", str(call.args[1]))
 
@@ -906,6 +1115,89 @@ class NodeLevelPolicyTests(unittest.TestCase):
         self.assertTrue(chained.uses_front)
         self.assertFalse(direct.uses_front)
 
+    def test_unproven_rounds_reach_the_gist_then_stop_creating_revisions(self):
+        result = dead(uses_front=True, front_alive=None)
+        remote, status = self.publish(self.old, [result])
+        self.assertEqual(status, "published")
+        self.assertIn(p.source_file("airport"), remote.files)
+        self.assertEqual(self.state(remote)["unproven_rounds"], 1)
+        for _ in range(p.UNPROVEN_ROUNDS_CAP + 1):
+            remote, status = self.publish(remote.files, [result])
+        self.assertEqual(self.state(remote)["unproven_rounds"], p.UNPROVEN_ROUNDS_CAP)
+        # At the cap the counter stops changing, so a permanently unprovable
+        # source no longer produces a manifest-only revision every round.
+        remote, status = self.publish(remote.files, [result])
+        self.assertEqual(status, "no_change")
+
+    def test_a_round_that_dialled_nothing_never_deletes_the_source(self):
+        """Batch validation can reject every root without dialling one.
+
+        That is "unjudgeable", not "dead": a config-parse regression, a kernel
+        version change or a -t timeout must never empty a healthy subscription.
+        """
+        result = p.SourceResult("airport", 10, 0, 0, "proxies: []\n")
+        result.measured = 0
+        result.invalid = 10
+        files = self.old
+        for round_number in range(1, 4):
+            files = p.plan_updates([result], files)
+            entry = json.loads(files["manifest.json"])["sources"][p.source_file("airport")]
+            self.assertIn(p.source_file("airport"), files)
+            self.assertEqual(entry["guard"], "not_dialled")
+            self.assertEqual(entry["bad_streak"], 0)
+            self.assertEqual(entry["unproven_rounds"], round_number)
+
+    def test_unverifiable_members_are_never_deleted_by_the_ratio_gate(self):
+        # Four published, this round only one v4 node answered and three nodes
+        # need an IPv6 route this host does not have.
+        reduced = p.SourceResult("airport", 4, 1, 1, self.old[p.source_file("airport")])
+        reduced.measured = 1
+        reduced.unverifiable = 3
+        files = self.old
+        for _ in range(3):
+            files = p.plan_updates([reduced], files)
+            entry = json.loads(files["manifest.json"])["sources"][p.source_file("airport")]
+            self.assertEqual(files[p.source_file("airport")], self.old[p.source_file("airport")])
+            self.assertEqual(entry["guard"], "unproven_hold")
+            self.assertEqual(entry["bad_streak"], 0)
+
+    def test_unmeasured_front_keeps_the_nodes_and_surfaces_the_round(self):
+        # The front is not a selected source, so nobody knew whether it was up.
+        # Its nodes must never be deleted, but the round must stop looking
+        # identical to a healthy one.
+        result = dead(uses_front=True, front_alive=None)
+        files = self.old
+        for round_number in range(1, 3):
+            files = p.plan_updates([result], files)
+            entry = json.loads(files["manifest.json"])["sources"][p.source_file("airport")]
+            self.assertIn(p.source_file("airport"), files)
+            self.assertEqual(entry["guard"], "front_unproven")
+            self.assertEqual(entry["bad_streak"], 0)
+            self.assertEqual(entry["unproven_rounds"], round_number)
+
+    def test_an_all_corrupt_round_keeps_the_previous_merged_body(self):
+        files = dict(self.old)
+        files[p.source_file("airport")] = "# truncated upload\n"
+        planned = p.plan_updates([], files)
+        # Quarantining the only artifact must not write an empty subscription.
+        self.assertEqual(planned["mihomo-alive.yaml"], files["mihomo-alive.yaml"])
+        self.assertNotIn(p.source_file("airport"), planned)
+
+    def test_a_corrupt_retained_artifact_is_quarantined_not_fatal(self):
+        files = dict(self.old)
+        broken = p.source_file("ghost")
+        files[broken] = "proxies: null\n"  # truncated / hand-edited artifact
+        remote, status = self.publish(files, [candidate(count=4)])
+        self.assertEqual(status, "published")
+        # The healthy source still publishes, and the unusable artifact is
+        # deleted on the same PATCH instead of blocking every future round.
+        self.assertIn(p.source_file("airport"), remote.files)
+        self.assertNotIn(broken, remote.files)
+        self.assertIsNone(remote.patches[0][broken])
+        manifest = json.loads(remote.files["manifest.json"])["sources"]
+        self.assertTrue(manifest[broken]["corrupt"])
+        self.assertEqual(manifest[broken]["guard"], "old_content_invalid")
+
 
 class V6WorkerMergeTests(unittest.TestCase):
     """A v6-capable helper settles what an IPv4-only runner cannot."""
@@ -914,6 +1206,9 @@ class V6WorkerMergeTests(unittest.TestCase):
         r = p.SourceResult("src", 3, alive, 0, None)
         r.unverifiable = unverifiable
         r.measured = measured
+        # The helper can only settle roots this round actually handed over; an
+        # answer naming anything else is discarded wholesale.
+        r.v6_roots = ["n1", "n2", "n3"]
         return r
 
     def test_promotes_answered_nodes_and_shrinks_unverifiable(self):
@@ -954,6 +1249,28 @@ class V6WorkerMergeTests(unittest.TestCase):
                 merged = p.merge_v6_results([result], payload)
                 self.assertEqual(merged[0].alive, 0)
                 self.assertEqual(merged[0].unverifiable, 3)
+
+
+    def test_helper_answer_naming_a_node_it_was_not_given_is_ignored(self):
+        """A poisoned or version-mismatched helper must not invent a node."""
+        result = self.result()
+        payload = {"host_ipv6": True, "judged": {"src": 3},
+                   "results": {"src": {"EVIL": {"alive": True, "ip": "2a0e:97c0::1", "cc": "HK"}}}}
+        merged = p.merge_v6_results([result], payload)
+        self.assertEqual(merged[0].alive, 0)
+        self.assertEqual(merged[0].unverifiable, 3)
+
+    def test_promoted_counts_only_measurements_the_helper_added(self):
+        result = self.result(alive=1, unverifiable=2)
+        result.v6_roots = ["n2", "n3"]
+        result.measurements = [p.Measurement("n1", "8.8.8.8", "US")]
+        result.content = None
+        payload = {"host_ipv6": True, "judged": {"src": 2},
+                   "results": {"src": {"n2": {"alive": True, "ip": "2a0e:97c0::2", "cc": "JP"}}}}
+        report = p.apply_v6([result], payload, {"src": {"proxies": []}},
+                            {"ok": False, "judged": 0, "promoted": 0, "error": ""})
+        self.assertEqual(report["promoted"], 1)
+        self.assertLessEqual(report["promoted"], report["judged"])
 
 
 class SourceSecretsTests(unittest.TestCase):

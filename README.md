@@ -6,7 +6,7 @@ Public execution repository. This tree is world-readable by design: subscription
 
 1. Read original subscriptions from Sub-Store (`GET` only). Exclude generated `probe-*`, `chain-*`, `rust-*`, `测活-DMIT`, and `官方可用` sources to avoid feedback loops.
 2. Use native mihomo on the GitHub-hosted Ubuntu runner. Validate each node with its full dialer dependency closure; never strip a required dialer into a direct connection.
-3. Request `https://www.cloudflare.com/cdn-cgi/trace` through a node-specific loopback HTTP listener, with certificate validation and no direct fallback. Only a successful trace with a global `ip` and valid `loc` counts as alive.
+3. Request `https://www.cloudflare.com/cdn-cgi/trace` through a node-specific loopback HTTP listener, with certificate validation and no direct fallback. Only a successful trace with a global `ip` and valid `loc` counts as alive. Every node gets a short first pass (a 1KB trace that needs longer is unusable); only failures spend the full timeout in a second pass, so a dead node costs fast+full instead of full+full. IPv6-bound nodes are settled by the helper host in parallel with the runner's own round.
 4. Rename from source/country/protocol/exit hash/connection fingerprint. Timing is not embedded in names.
 5. For **GlaDOS only**, group successful nodes by actual trace exit IP. For a duplicate-exit group prefer Shadowsocks (`ss`); if the group has no SS, keep one deterministic member. A unique exit is retained regardless of protocol (including AnyTLS/Trojan). This is NOT a global SS-only filter. Other sources keep their protocols and are not collapsed by exit.
 6. PATCH fixed files in the existing secret Gist. Retain unrelated Gist files. Same YAML content produces no new revision. GitHub Gist PATCH rejects `If-Match` (HTTP 400); instead serialize this workflow and recheck the managed-file snapshot before writing. This is not server-side atomic compare-and-swap: never add a second writer for these managed filenames.
@@ -23,15 +23,51 @@ round dialled it and the attempt failed.
 |---|---|
 | any alive, at least half of the previous count | replaced with this round's alive set |
 | any alive, fewer than half (severely reduced) | kept this round; replaced by the alive set on the **2nd consecutive** reduced round |
+| any alive, but some nodes could not be judged (`unverifiable`, or the front was not proven alive) | **held** (`unproven_hold`): a shrink is published only when every missing node was dialled and failed |
 | every dialled node failed | kept this round; **dropped** on the **2nd consecutive** round, so its dead nodes leave the merged subscription |
 | source could not be fetched | kept (nothing was proven) |
-| nodes hang off a dead front (`uses_front`) | kept (the front failed, not the nodes) |
+| **no node could be dialled** (every root rejected by kernel validation) | kept (`not_dialled`); `unproven_rounds` advances, `bad_streak` does not |
+| nodes hang off a dead or unmeasured front (`uses_front`) | kept (`front_unproven`); the front is measured once per round so this is attributable |
 | nodes need IPv6 the host cannot reach | kept (unverifiable, never scored dead) |
+| a retained artifact is unparsable (`proxies: null`, truncated) | quarantined and deleted on the same PATCH instead of blocking the round |
 
 `bad_streak` in `manifest.json` is the consecutive-round counter that drives the
-grace. Only the survival baseline and that counter force a manifest-only
-revision; audit-only fields are allowed to lag so a failed round does not create
-revision noise.
+grace and counts **proven** failures only. `unproven_rounds` counts consecutive
+rounds that produced no node-level evidence at all (unfetchable source,
+unmeasurable nodes, unprovable front); it never deletes an artifact and exists
+so an unjudgeable source is visible instead of silently frozen. Only the
+survival baseline and those counters force a manifest-only revision;
+audit-only fields are allowed to lag so a failed round does not create revision
+noise.
+
+A held source keeps its previous body until the missing nodes can be judged
+again. That is deliberately conservative: a source with an unmeasurable member
+will not shrink while the host (or the helper) cannot judge it, because the
+alternative is deleting a node for a limitation of the observer.
+
+
+## Naming
+
+A published name is `<flag><country>-<brand>-<city>` plus, only when two
+connections would otherwise share it, an ordinal `-2`/`-3`. The ordinal is
+chosen **once**: the resulting name is stored in `manifest.json` under `names`,
+keyed by connection fingerprint, with one namespace per published file (the
+merged subscription and each `source-*.yaml`). Later rounds reuse it verbatim,
+so a node keeps its name when a sibling dies, when a geolocation lookup is
+temporarily unavailable, or when another source is added.
+
+The table is bounded: entries are dropped only once it outgrows the live set by
+2x (or 1000 connections). Connections that are no longer published lose their
+reservation and would receive a new name if they returned.
+
+`manifest.json` also carries `http1` per source: alive nodes that negotiated
+HTTP/1.1 instead of HTTP/2. It is an audit signal for a downgraded hop, never a
+deletion rule.
+
+Before measuring, the probe records the runner's own egress address with one
+direct trace. A node that reports that address never carried the request (a
+configuration bug or a silent DIRECT fallback); such a trace is counted in
+`direct_leak` and never counts as a measured alive node.
 
 
 ## Trigger / cadence
