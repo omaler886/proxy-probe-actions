@@ -65,11 +65,17 @@ HTTP/1.1 instead of HTTP/2. It is an audit signal for a downgraded hop, never a
 deletion rule.
 
 Three audit fields are recorded per source and never affect selection:
-`delay_median_ms`/`delay_p90_ms` (kernel `/delay` round trip; 0 = no evidence),
-`landing` (`same`/`transit`/`unknown`, comparing the measured exit with the
-node's `server` literal — a relay or CDN front is legitimate, so it is
-annotated only), and `asn_class` (`cdn`/`datacenter`/`residential`/`mobile`/
-`unknown`, from the egress ASN).
+`delay_median_ms`/`delay_p90_ms` (end-to-end round trip from curl's
+`%{time_total}`, or from the optional kernel `/delay` prefilter when enabled;
+0 = no evidence), `landing` (`same`/`transit`/`unknown`, comparing the measured
+exit with the node's `server` literal — a relay or CDN front is legitimate, so
+it is annotated only), and `asn_class` (`cdn`/`datacenter`/`residential`/
+`mobile`/`unknown`, from the egress ASN).
+
+The `/delay` prefilter is **opt-in** (`PROBE_DELAY_PREFILTER=1`). Measured on
+the real workload, a safe configuration (a failed 3s probe retried at curl's
+full 15s budget) cost more wall time than it saved once kernels were merged:
+121.4s vs 81.7s of measurement, with no additional alive nodes.
 
 Measurement itself is de-duplicated twice: identical connection definitions
 inside one source share a single dial (the verdict is replicated to every

@@ -97,6 +97,7 @@ def main():
                 "alive": True,
                 "ip": item_measured.ip,
                 "cc": item_measured.cc,
+                "delay_ms": item_measured.delay_ms,
             }
         # Roots the kernel refused or that stayed unverifiable were not
         # judged; everything else was dialled and simply did not come back.

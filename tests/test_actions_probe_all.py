@@ -118,9 +118,9 @@ class TraceTests(unittest.TestCase):
             self.assertIn("--write-out", command)
             self.assertEqual(kwargs["stdout"], subprocess.PIPE)
             Path(command[command.index("--output") + 1]).write_text(self.GOOD, encoding="utf-8")
-            return mock.Mock(returncode=0, stdout=b"2 0")
+            return mock.Mock(returncode=0, stdout=b"2 0 0.412")
         with tempfile.TemporaryDirectory() as temp, mock.patch.object(p.subprocess, "run", side_effect=fake_run):
-            self.assertEqual(p.NativeProbe("mihomo").trace(12345, temp), ("8.8.8.8", "US", "2"))
+            self.assertEqual(p.NativeProbe("mihomo").trace(12345, temp), ("8.8.8.8", "US", "2", 412))
 
     def test_a_failed_certificate_verdict_is_not_a_measurement(self):
         def fake_run(command, **kwargs):
@@ -151,7 +151,7 @@ class TraceTests(unittest.TestCase):
 
         def fake_run(command, **kwargs):
             Path(command[command.index("--output") + 1]).write_text(self.GOOD, encoding="utf-8")
-            return mock.Mock(returncode=0, stdout=b"2 0")
+            return mock.Mock(returncode=0, stdout=b"2 0 0.412")
 
         with mock.patch.object(probe, "validate", return_value=True), \
              mock.patch.object(probe, "health", return_value=True), \
@@ -1573,6 +1573,18 @@ class DelayPrefilterTests(unittest.TestCase):
             measured, invalid, unverifiable = probe(graph, ["a"])
         self.assertEqual(delay.call_count, 1)
         self.assertEqual(len(measured), 1)
+
+    def test_curl_time_total_supplies_delay_when_the_prefilter_is_off(self):
+        graph = p.Graph({"proxies": [node("a", server="1.1.1.1")]})
+        probe = p.NativeProbe("mihomo")
+        process = self._process()
+        with mock.patch.object(probe, "validate", return_value=True), \
+             mock.patch.object(probe, "health", return_value=True), \
+             mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US", "2", 1500)), \
+             mock.patch.object(p.subprocess, "Popen", return_value=process):
+            measured, invalid, unverifiable = probe(graph, ["a"])
+        self.assertEqual(measured[0].delay_ms, 1500)
+        self.assertEqual(probe.prefiltered, 0)
 
 
 class MergedKernelTests(unittest.TestCase):

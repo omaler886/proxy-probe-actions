@@ -218,7 +218,10 @@ def merge_v6_results(results, payload):
                 continue
             if not addr.is_global or cc not in COUNTRIES:
                 continue
-            promoted.append(Measurement(str(name), ip, cc))
+            delay = verdict.get("delay_ms")
+            if not isinstance(delay, int) or isinstance(delay, bool) or delay < 0:
+                delay = 0
+            promoted.append(Measurement(str(name), ip, cc, delay_ms=min(delay, 300000)))
         # A node is proven dead only when the helper dialled it and said nothing
         # about it. An answer we cannot parse proves nothing either way, so it
         # must leave the node unverifiable instead of silently killing it.
@@ -834,12 +837,12 @@ class NativeProbe:
                 # visible instead of eating the whole budget.
                 "--connect-timeout", str(min(4, budget)), "--proto", "=https",
                 "--max-filesize", "65536",
-                "--output", path, "--write-out", "%{http_version} %{ssl_verify_result}",
+                "--output", path, "--write-out", "%{http_version} %{ssl_verify_result} %{time_total}",
                 TRACE_URL,
             ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=budget + 3)
             if run.returncode:
                 return None
-            ok, version = self.negotiation(run.stdout)
+            ok, version, elapsed_ms = self.negotiation(run.stdout)
             if not ok:
                 return None
             ip, cc = parse_trace(Path(path).read_text(encoding="utf-8"))
@@ -849,7 +852,7 @@ class NativeProbe:
                 # measurement, and not worth a retry either.
                 self.suppressed += 1
                 return DIRECT_LEAK
-            return ip, cc, version
+            return ip, cc, version, elapsed_ms
         except (OSError, UnicodeError, subprocess.TimeoutExpired, ProbeError):
             return None
         finally:
@@ -858,24 +861,32 @@ class NativeProbe:
 
     @staticmethod
     def negotiation(raw):
-        """Parse curl's write-out: ``(verified, http_version)``.
+        """Parse curl's write-out: ``(verified, http_version, elapsed_ms)``.
 
         ``ssl_verify_result`` is 0 for a validated chain; a non-zero value means
         curl reached the endpoint without trusting it, which is never a usable
         measurement. HTTP/1.1 is recorded, not rejected: the caller reports it
-        as ``http1`` so a downgraded hop is visible instead of silent.
+        as ``http1`` so a downgraded hop is visible instead of silent. The
+        elapsed time is the end-to-end round trip through the node; it is the
+        latency field even when the optional /delay prefilter is off.
         """
         try:
             parts = raw.decode("utf-8", "replace").split()
         except Exception:
-            return False, ""
+            return False, "", 0
         if len(parts) < 2:
-            return True, ""
+            return True, "", 0
         try:
             verified = int(parts[1]) == 0
         except ValueError:
             verified = False
-        return verified, parts[0]
+        elapsed = 0
+        if len(parts) >= 3:
+            try:
+                elapsed = max(0, int(round(float(parts[2]) * 1000)))
+            except (TypeError, ValueError):
+                elapsed = 0
+        return verified, parts[0], elapsed
 
     def health(self, process, controller, secret, once=False):
         if process.poll() is not None:
@@ -1044,10 +1055,13 @@ class NativeProbe:
             normalized = []
             for index in range(len(lanes)):
                 item = evidence[index]
-                if isinstance(item, tuple) and len(item) == 2:
-                    # Tolerate the old two-field shape (tests/fakes); the
-                    # production trace returns (ip, cc, http_version).
-                    item = (item[0], item[1], "")
+                if isinstance(item, tuple):
+                    # Tolerate the older shapes (tests/fakes); production
+                    # returns (ip, cc, http_version, elapsed_ms).
+                    if len(item) == 2:
+                        item = (item[0], item[1], "", 0)
+                    elif len(item) == 3:
+                        item = (item[0], item[1], item[2], 0)
                 normalized.append((item, delays.get(index, 0)))
             return normalized, not healthy, skipped
         except OSError:
@@ -1168,9 +1182,12 @@ class NativeProbe:
                     if degraded and (job_index, group[0]) in outcome:
                         unverifiable[job_index] += len(group)
                     continue
-                ip, cc, version = item
+                ip, cc, version, elapsed_ms = item
+                # The delay probe's number wins when enabled; otherwise curl's
+                # own write-out supplies the end-to-end latency for free.
+                latency = delay or elapsed_ms
                 for root in group:
-                    measured.append(Measurement(root, ip, cc, version, delay))
+                    measured.append(Measurement(root, ip, cc, version, latency))
             results.append((measured, invalid_count, unverifiable[job_index], prefiltered))
         return results
 
@@ -1265,9 +1282,10 @@ class NativeProbe:
                 if degraded:
                     unverifiable += len(group)
                 continue
-            ip, cc, version = item
+            ip, cc, version, elapsed_ms = item
+            latency = delay or elapsed_ms
             for root in group:
-                measured.append(Measurement(root, ip, cc, version, delay))
+                measured.append(Measurement(root, ip, cc, version, latency))
         return measured, invalid_count, unverifiable
 
 
@@ -2385,7 +2403,7 @@ def run(env=None, transport=None, probe=None):
                 # trace plus a full retry; survivors still get a curl trace for
                 # exit IP / TLS evidence, so the prefilter never replaces it.
                 delay_ms=(env_int(env.get("PROBE_DELAY_TIMEOUT_MS", 3000), 3000, 0, 30000)
-                          if env_flag(env.get("PROBE_DELAY_PREFILTER"), True) else 0),
+                          if env_flag(env.get("PROBE_DELAY_PREFILTER"), False) else 0),
                 # A first-budget failure is retried once at this budget before
                 # the node is skipped, so only the genuinely dead are dropped.
                 delay_retry_ms=env_int(env.get("PROBE_DELAY_RETRY_MS", 15000), 15000, 0, 30000),
