@@ -1507,7 +1507,7 @@ class DelayPrefilterTests(unittest.TestCase):
         probe = p.NativeProbe("mihomo", delay_ms=2000)
         process = self._process()
 
-        def delay(controller, secret, name):
+        def delay(controller, secret, name, timeout_ms=None):
             return (False, 0, False) if name == "dead" else (True, 321, False)
 
         with mock.patch.object(probe, "validate", return_value=True), \
@@ -1537,6 +1537,42 @@ class DelayPrefilterTests(unittest.TestCase):
         self.assertEqual(probe.prefiltered, 0)
         self.assertEqual(trace.call_count, 2)
         self.assertTrue(all(item.delay_ms == 0 for item in measured))
+
+    def test_a_slow_node_is_retried_before_being_skipped(self):
+        """One short budget is stricter than curl; the retry protects the tail."""
+        graph = p.Graph({"proxies": [node("slow", server="1.1.1.1")]})
+        probe = p.NativeProbe("mihomo", delay_ms=3000, delay_retry_ms=8000)
+        process = self._process()
+        budgets = []
+
+        def delay(controller, secret, name, timeout_ms=None):
+            budgets.append(timeout_ms)
+            return (timeout_ms == 8000, 4200 if timeout_ms == 8000 else 0, False)
+
+        with mock.patch.object(probe, "validate", return_value=True), \
+             mock.patch.object(probe, "health", return_value=True), \
+             mock.patch.object(probe, "delay_probe", side_effect=delay), \
+             mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US", "2")) as trace, \
+             mock.patch.object(p.subprocess, "Popen", return_value=process):
+            measured, invalid, unverifiable = probe(graph, ["slow"])
+        self.assertEqual(budgets, [3000, 8000])
+        self.assertEqual(len(measured), 1)
+        self.assertEqual(measured[0].delay_ms, 4200)
+        self.assertEqual(probe.prefiltered, 0)
+        self.assertEqual(trace.call_count, 1)
+
+    def test_controller_errors_are_not_retried(self):
+        graph = p.Graph({"proxies": [node("a", server="1.1.1.1")]})
+        probe = p.NativeProbe("mihomo", delay_ms=3000, delay_retry_ms=8000)
+        process = self._process()
+        with mock.patch.object(probe, "validate", return_value=True), \
+             mock.patch.object(probe, "health", return_value=True), \
+             mock.patch.object(probe, "delay_probe", return_value=(False, 0, True)) as delay, \
+             mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US", "2")), \
+             mock.patch.object(p.subprocess, "Popen", return_value=process):
+            measured, invalid, unverifiable = probe(graph, ["a"])
+        self.assertEqual(delay.call_count, 1)
+        self.assertEqual(len(measured), 1)
 
 
 class MergedKernelTests(unittest.TestCase):
@@ -1614,7 +1650,7 @@ class MergedKernelTests(unittest.TestCase):
         process = mock.Mock()
         process.poll.return_value = None
 
-        def delay(controller, secret, name):
+        def delay(controller, secret, name, timeout_ms=None):
             return (False, 0, False) if name.startswith("s1-") else (True, 50, False)
 
         with mock.patch.object(probe, "validate", return_value=True), \

@@ -763,7 +763,7 @@ class SourceJob:
 
 class NativeProbe:
     def __init__(self, binary, workers=8, timeout=15, transport=None, ipv6=None,
-                 delay_ms=0, kernel_batch=0, dedupe=False):
+                 delay_ms=0, delay_retry_ms=0, kernel_batch=0, dedupe=False):
         self.binary = binary
         self.workers = max(1, min(MAX_WORKERS, int(workers)))
         self.timeout = max(1, min(120, int(timeout)))
@@ -786,9 +786,13 @@ class NativeProbe:
         #: Number of multi-source kernels started this round.
         self.merged_groups = 0
         #: ``/proxies/<name>/delay`` budget in ms; 0 disables the prefilter.
-        #: It runs BEFORE curl, so a dead node costs one 2s API call instead of
-        #: a short trace plus a full retry. Delay is also kept as evidence.
+        #: It runs BEFORE curl, so a dead node costs one short API call instead
+        #: of a short trace plus a full retry. Delay is also kept as evidence.
         self.delay_ms = max(0, min(30000, int(delay_ms or 0)))
+        #: One retry budget for lanes that failed the first delay probe. The
+        #: slow-but-alive tail (3-8s for 1KB) must not be skipped just because
+        #: a single short budget is stricter than curl's 5s+15s trace.
+        self.delay_retry_ms = max(0, min(30000, int(delay_retry_ms or 0)))
         #: Sources per shared kernel; 0 = one kernel for the whole round.
         self.kernel_batch = max(0, int(kernel_batch or 0))
         #: Collapse identical connection definitions within one source.
@@ -927,7 +931,7 @@ class NativeProbe:
         self._assess(directory, graph, batch[:mid], secret, accepted, invalid)
         self._assess(directory, graph, batch[mid:], secret, accepted, invalid)
 
-    def delay_probe(self, controller, secret, name):
+    def delay_probe(self, controller, secret, name, timeout_ms=None):
         """Ask the kernel to dial one proxy and report latency.
 
         Returns ``(ok, delay_ms, infra)``. ``infra`` means the controller
@@ -936,12 +940,13 @@ class NativeProbe:
         A 408/504 is the kernel's own verdict that the node could not deliver
         the request in the budget, which is a real negative.
         """
+        budget = max(1, min(30000, int(timeout_ms or self.delay_ms)))
         url = ("http://127.0.0.1:" + str(controller) + "/proxies/"
                + urllib.parse.quote(str(name), safe="") + "/delay?"
-               + urllib.parse.urlencode({"timeout": self.delay_ms, "url": TRACE_URL}))
+               + urllib.parse.urlencode({"timeout": budget, "url": TRACE_URL}))
         request = urllib.request.Request(url, headers={"Authorization": "Bearer " + secret})
         try:
-            with self.opener.open(request, timeout=self.delay_ms / 1000.0 + 2) as response:
+            with self.opener.open(request, timeout=budget / 1000.0 + 2) as response:
                 document = json.loads(response.read())
             delay = int(document.get("delay") or 0)
             return (delay > 0, delay, False)
@@ -953,7 +958,13 @@ class NativeProbe:
             return (False, 0, True)
 
     def _prefilter(self, lanes, controller, secret):
-        """Run the kernel delay probe over every lane, aligned by index.
+        """Two-stage delay pre-screen over every lane, aligned by index.
+
+        A single short budget is measurably stricter than curl's 5s+15s trace:
+        the slow tail (3-8s for 1KB) was being skipped while the old probe
+        counted it alive, and the loss tracked the prefilter count almost 1:1.
+        A failure is therefore retried once with ``delay_retry_ms`` before the
+        lane is skipped; curl still measures every survivor by construction.
 
         Returns ``({index: delay_ms}, {skipped_index})``. A controller-level
         error leaves the lane OUT of ``skipped``: it is traced by curl exactly
@@ -962,18 +973,31 @@ class NativeProbe:
         if not self.delay_ms:
             return {}, set()
         delays, skipped = {}, set()
+        pending = list(range(len(lanes)))
+        budgets = [self.delay_ms]
+        if self.delay_retry_ms > self.delay_ms:
+            budgets.append(self.delay_retry_ms)
         # The controller answers these in parallel; 32 left dead nodes queuing
         # (~3s each) behind the pool. Use the round's dial concurrency as the
         # ceiling so the prefilter cannot become the new bottleneck.
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(self.workers, 128))) as pool:
-            outcomes = list(pool.map(lambda lane: self.delay_probe(controller, secret, lane[0]), lanes))
-        for index, (ok, delay, infra) in enumerate(outcomes):
-            if infra:
-                continue
-            if ok:
-                delays[index] = delay
-            else:
-                skipped.add(index)
+            for budget in budgets:
+                if not pending:
+                    break
+                outcomes = list(pool.map(
+                    lambda index: self.delay_probe(controller, secret, lanes[index][0], budget),
+                    pending,
+                ))
+                retry = []
+                for index, (ok, delay, infra) in zip(pending, outcomes):
+                    if infra:
+                        continue
+                    if ok:
+                        delays[index] = delay
+                    else:
+                        retry.append(index)
+                pending = retry
+        skipped = set(pending)
         self.prefiltered += len(skipped)
         return delays, skipped
 
@@ -2362,6 +2386,9 @@ def run(env=None, transport=None, probe=None):
                 # exit IP / TLS evidence, so the prefilter never replaces it.
                 delay_ms=(env_int(env.get("PROBE_DELAY_TIMEOUT_MS", 3000), 3000, 0, 30000)
                           if env_flag(env.get("PROBE_DELAY_PREFILTER"), True) else 0),
+                # A first-budget failure is retried once at this budget before
+                # the node is skipped, so only the genuinely dead are dropped.
+                delay_retry_ms=env_int(env.get("PROBE_DELAY_RETRY_MS", 8000), 8000, 0, 30000),
                 kernel_batch=env_int(env.get("PROBE_KERNEL_BATCH", 0), 0, 0, 100000),
                 dedupe=env_flag(env.get("PROBE_DEDUPE"), True),
             )

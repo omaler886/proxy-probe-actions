@@ -150,6 +150,9 @@ jobs:
           # (exit IP, TLS verdict), so this never replaces the evidence.
           PROBE_DELAY_PREFILTER: '1'
           PROBE_DELAY_TIMEOUT_MS: '3000'
+          # A first-budget miss is retried at 8s before curl is skipped: the
+          # slow-but-alive tail must never be dropped by a single short budget.
+          PROBE_DELAY_RETRY_MS: '8000'
           # Identical connection definitions inside one source share one dial;
           # the verdict is replicated to every duplicate label.
           PROBE_DEDUPE: '1'
@@ -164,7 +167,7 @@ jobs:
           PROBE_V6_MIHOMO: /opt/probe-v6/bin/mihomo
           # The helper now measures all v6 roots through one kernel, so the
           # dial pool is the limit rather than 38 kernel starts.
-          PROBE_V6_WORKERS: '24'
+          PROBE_V6_WORKERS: '48'
         run: |
           set -euo pipefail
           umask 077
