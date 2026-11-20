@@ -869,6 +869,12 @@ class NativeProbe:
             ports = unused_ports(len(accepted) + 1)
             controller = ports[-1]
             cfg = kernel_config(graph, accepted, ports[:-1], controller, secret)
+            # Popen reads directory/config.yaml, and the last writer was
+            # _assess with the BATCH config (different ports). Materialize the
+            # final body unconditionally: skipping validation must not skip the
+            # write, or the kernel listens on the batch ports while readiness
+            # polls the new controller port.
+            private_write(Path(directory) / "config.yaml", canonical(cfg))
             # _assess already validated every accepted root. The only difference
             # here is the listener port numbers, and ``-t`` does not bind them,
             # so re-validating the identical node set is a second kernel start

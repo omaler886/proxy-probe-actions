@@ -802,6 +802,33 @@ class NativeTests(unittest.TestCase):
         validate.assert_not_called()
         start.assert_not_called()
 
+    def test_the_launched_config_carries_the_ports_that_are_probed(self):
+        """Skipping the second -t must not skip writing the final config.
+
+        Popen reads directory/config.yaml, and _assess last wrote the BATCH
+        variant with different ports. Launching that while polling the new
+        controller port made readiness time out (kernel_start_failure).
+        """
+        graph = p.Graph({"proxies": [node("a")]})
+        probe = p.NativeProbe("mihomo")
+        process = mock.Mock()
+        process.poll.return_value = None
+        writes = []
+
+        def fake_write(path, content):
+            writes.append((Path(path).name, content))
+
+        with mock.patch.object(probe, "validate", return_value=True), \
+             mock.patch.object(probe, "health", return_value=True) as health, \
+             mock.patch.object(probe, "trace", return_value=("8.8.8.8", "US", "2")), \
+             mock.patch.object(p, "private_write", side_effect=fake_write), \
+             mock.patch.object(p.subprocess, "Popen", return_value=process):
+            measured, invalid, unverifiable = probe(graph, ["a"])
+        self.assertEqual(len(measured), 1)
+        controller = str(health.call_args.args[1])
+        self.assertEqual(writes[-1][0], "config.yaml")
+        self.assertIn(controller, writes[-1][1])
+
     def test_failed_nodes_get_one_short_pass_then_one_full_pass(self):
         """Pass 1 is cheap for everyone; only failures pay the full timeout."""
         graph = p.Graph({"proxies": [node("dead"), node("live")]})
