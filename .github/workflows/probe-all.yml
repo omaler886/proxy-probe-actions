@@ -148,7 +148,7 @@ jobs:
           # dead node costs 3s instead of a short trace plus a full retry, and
           # the delay becomes an audit field. Survivors still get the curl trace
           # (exit IP, TLS verdict), so this never replaces the evidence.
-          PROBE_DELAY_PREFILTER: '1'
+          PROBE_DELAY_PREFILTER: '0'
           PROBE_DELAY_TIMEOUT_MS: '3000'
           # A first-budget miss is retried at the SAME 15s budget as curl's final
           # pass: the prefilter must never be stricter than the measurement it
